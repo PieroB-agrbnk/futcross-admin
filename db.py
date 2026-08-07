@@ -72,12 +72,24 @@ def listar_planes(solo_activos: bool = True) -> pd.DataFrame:
 
 def crear_plan(nombre, sesiones, vigencia_dias, precio, descripcion=None):
     return _tabla("planes").insert({
-        "nombre": nombre.strip(),
+        "nombre": nombre.strip().upper(),
         "sesiones": int(sesiones),
         "vigencia_dias": int(vigencia_dias),
         "precio": float(precio),
         "descripcion": descripcion,
     }).execute().data
+
+
+def plan(plan_id: str) -> dict | None:
+    r = _tabla("planes").select("*").eq("id", plan_id).limit(1).execute().data
+    return r[0] if r else None
+
+
+def paquetes_con_plan(plan_id: str) -> int:
+    """Cuantas ventas usan este plan. Sirve para avisar antes de editarlo."""
+    r = (_tabla("paquetes").select("id", count="exact")
+         .eq("plan_id", plan_id).execute())
+    return r.count or 0
 
 
 def actualizar_plan(plan_id: str, cambios: dict):
@@ -190,20 +202,61 @@ def listar_paquetes(estados: list[str] | None = None) -> pd.DataFrame:
 
 
 def crear_paquete(alumno_id, plan: dict, fecha_inicio: date, precio: float,
-                  medio_pago: str, pagado: bool = True, observacion: str | None = None):
-    fecha_fin = logic.fecha_fin_plan(fecha_inicio, int(plan["vigencia_dias"]))
+                  medio_pago: str, pagado: bool = True, observacion: str | None = None,
+                  fecha_pedido: date | None = None, sede: str | None = None,
+                  dias_asiste: str | None = None, vendedor: str | None = None,
+                  tipo: str = "NUEVO", sesiones: int | None = None,
+                  vigencia_dias: int | None = None):
+    """Registra la venta con todos los datos del pedido.
+
+    sesiones y vigencia_dias permiten ajustar el plan para una venta puntual
+    (por ejemplo, regalar dos sesiones) sin tocar el catalogo.
+    """
+    total = int(sesiones or plan["sesiones"])
+    dias = int(vigencia_dias or plan["vigencia_dias"])
+    fecha_fin = logic.fecha_fin_plan(fecha_inicio, dias)
+
     return _tabla("paquetes").insert({
         "alumno_id": alumno_id,
         "plan_id": plan.get("id"),
         "plan_nombre": plan["nombre"],
-        "sesiones_totales": int(plan["sesiones"]),
+        "sesiones_totales": total,
+        "fecha_pedido": (fecha_pedido or fecha_inicio).isoformat(),
         "fecha_inicio": fecha_inicio.isoformat(),
         "fecha_fin": fecha_fin.isoformat(),
         "precio": float(precio),
         "medio_pago": medio_pago,
         "pagado": bool(pagado),
+        "sede": sede,
+        "dias_asiste": dias_asiste,
+        "vendedor": vendedor,
+        "tipo": tipo,
         "observacion": observacion,
     }).execute().data
+
+
+def actualizar_paquete(paquete_id: str, cambios: dict):
+    limpio = {k: _iso(v) for k, v in cambios.items()}
+    return _tabla("paquetes").update(limpio).eq("id", paquete_id).execute().data
+
+
+def siguiente_pedido() -> int:
+    """Solo para mostrarlo antes de guardar; el numero real lo pone la base."""
+    r = (_tabla("paquetes").select("nro_pedido")
+         .order("nro_pedido", desc=True).limit(1).execute().data)
+    return (r[0]["nro_pedido"] or 0) + 1 if r else 1
+
+
+def vendedores() -> list:
+    """Los vendedores que ya se usaron, para no escribirlos de nuevo."""
+    r = _tabla("paquetes").select("vendedor").execute().data or []
+    return sorted({(x.get("vendedor") or "").strip() for x in r if x.get("vendedor")})
+
+
+def sedes() -> list:
+    r = _tabla("alumnos").select("sede").execute().data or []
+    vistas = {(x.get("sede") or "").strip() for x in r if x.get("sede")}
+    return sorted(vistas | {"SURQUILLO"})
 
 
 def cancelar_paquete(paquete_id: str, motivo: str):

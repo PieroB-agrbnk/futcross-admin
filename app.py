@@ -23,6 +23,10 @@ import theme       # noqa: E402
 
 theme.aplicar_estilos()
 
+DIAS_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
+TURNOS = ["MANANA", "TARDE", "NOCHE"]
+MEDIOS_PAGO = ["YAPE", "PLIN", "EFECTIVO", "TRANSFERENCIA", "TARJETA", "OTRO"]
+
 MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio",
          "julio", "agosto", "setiembre", "octubre", "noviembre", "diciembre"]
 DIAS = ["lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo"]
@@ -453,16 +457,31 @@ def pagina_alumnos() -> None:
             c1, c2 = st.columns(2)
             nombres = c1.text_input("Nombres *")
             apellidos = c2.text_input("Apellidos *")
-            dni = c1.text_input("DNI")
-            telefono = c2.text_input("Telefono (9 digitos)")
+            dni = c1.text_input("DNI", help="Es lo que el alumno escribe en la tablet")
+            telefono = c2.text_input("Telefono (9 digitos)",
+                                     help="Se usa para el WhatsApp de renovacion")
             email = c1.text_input("Correo")
             nacimiento = c2.date_input("Fecha de nacimiento", value=None,
                                        min_value=logic.hoy() - timedelta(days=365 * 80),
                                        max_value=logic.hoy(), format="DD/MM/YYYY")
-            inscripcion = c1.date_input("Fecha de inscripcion", value=logic.hoy(),
-                                        format="DD/MM/YYYY")
-            sede = c2.text_input("Sede", value="Sede principal")
-            horario = c1.text_input("Horario habitual", placeholder="Lun/Mie/Vie 8 p.m.")
+            inscripcion = c1.text_input("Fecha de inscripcion", value="", disabled=True,
+                                        placeholder="se toma la de hoy")
+            inscripcion = logic.hoy()
+
+            st.markdown("**Donde y cuando entrena**")
+            d1, d2, d3 = st.columns([1.2, 1, 2])
+            try:
+                opciones_sede = db.sedes()
+            except Exception:
+                opciones_sede = ["SURQUILLO"]
+            sede = d1.selectbox("Sede", opciones_sede + ["Otra..."])
+            if sede == "Otra...":
+                sede = d1.text_input("Nombre de la sede nueva", key="sede_nueva")
+            turno = d2.selectbox("Turno", TURNOS)
+            dias = d3.multiselect("Dias que asiste", DIAS_SEMANA,
+                                  default=["LUN", "MIE", "VIE"])
+            horario = st.text_input("Hora exacta", placeholder="8:00 p.m.")
+
             emergencia = c2.text_input("Contacto de emergencia")
             notas = st.text_area("Notas", placeholder="Lesiones previas, observaciones, etc.")
 
@@ -479,7 +498,10 @@ def pagina_alumnos() -> None:
                             "email": email.strip() or None,
                             "fecha_nacimiento": nacimiento,
                             "fecha_inscripcion": inscripcion,
-                            "sede": sede, "horario": horario,
+                            "sede": sede,
+                            "turno": turno,
+                            "dias_asiste": " ".join(dias),
+                            "horario": horario,
                             "contacto_emergencia": emergencia, "notas": notas,
                         })
                         st.success(f"Alumno registrado con codigo {creado[0]['codigo']}. "
@@ -599,30 +621,91 @@ def pagina_paquetes() -> None:
                 "Si vendes uno nuevo, el sistema consumira primero el que vence antes."
             )
 
-        with st.form("form_paquete"):
-            c1, c2 = st.columns(2)
-            nombre_plan = c1.selectbox("Plan", planes["nombre"].tolist())
-            plan = planes[planes["nombre"] == nombre_plan].iloc[0].to_dict()
-            inicio = c2.date_input("Inicio de vigencia", value=logic.hoy(), format="DD/MM/YYYY")
-            fin = logic.fecha_fin_plan(inicio, int(plan["vigencia_dias"]))
+        # Lo que ya sabemos del alumno se hereda, para no volver a escribirlo
+        datos_alumno = alumnos[alumnos["alumno_id"] == alumno_id].iloc[0]
+        try:
+            pedido = db.siguiente_pedido()
+            lista_vendedores = db.vendedores()
+            lista_sedes = db.sedes()
+        except Exception:
+            pedido, lista_vendedores, lista_sedes = 1, [], ["SURQUILLO"]
 
-            c3, c4, c5 = st.columns(3)
-            precio = c3.number_input("Precio cobrado (S/)", value=float(plan["precio"]),
+        with st.form("form_paquete"):
+            st.markdown(f"**Pedido N {pedido}**")
+
+            c1, c2, c3 = st.columns([2, 1, 1])
+            nombre_plan = c1.selectbox("Plan contratado", planes["nombre"].tolist())
+            plan = planes[planes["nombre"] == nombre_plan].iloc[0].to_dict()
+            fecha_pedido = c2.date_input("Fecha del pedido", value=logic.hoy(),
+                                         format="DD/MM/YYYY",
+                                         help="Cuando se cerro la venta")
+            inicio = c3.date_input("Inicio del plan", value=logic.hoy(),
+                                   format="DD/MM/YYYY",
+                                   help="Puede ser posterior a la fecha del pedido")
+
+            # Se puede ajustar el plan para una venta puntual sin tocar el catalogo
+            a1, a2 = st.columns(2)
+            sesiones = a1.number_input("Sesiones", min_value=1,
+                                       value=int(plan["sesiones"]),
+                                       help="Cambialo solo si esta venta es una excepcion")
+            vigencia = a2.number_input("Dias de vigencia", min_value=1,
+                                       value=int(plan["vigencia_dias"]))
+            fin = logic.fecha_fin_plan(inicio, int(vigencia))
+
+            st.markdown("**Donde entrena**")
+            d1, d2 = st.columns([1, 2])
+            sede_previa = datos_alumno.get("sede")
+            if sede_previa and not pd.isna(sede_previa):
+                opciones = [sede_previa] + [x for x in lista_sedes if x != sede_previa]
+            else:
+                opciones = lista_sedes
+            sede = d1.selectbox("Sede y turno", opciones)
+            dias_previos = datos_alumno.get("dias_asiste")
+            if dias_previos and not pd.isna(dias_previos):
+                por_defecto = str(dias_previos).split()
+            else:
+                por_defecto = ["LUN", "MIE", "VIE"]
+            dias = d2.multiselect("Dias que asiste", DIAS_SEMANA,
+                                  default=[d for d in por_defecto if d in DIAS_SEMANA])
+
+            st.markdown("**Cobro**")
+            e1, e2, e3 = st.columns(3)
+            precio = e1.number_input("Monto total (S/)", value=float(plan["precio"]),
                                      min_value=0.0, step=10.0)
-            medio = c4.selectbox("Medio de pago", ["Yape", "Plin", "Efectivo",
-                                                   "Transferencia", "Tarjeta", "Otro"])
-            pagado = c5.selectbox("Estado del pago", ["Pagado", "Pendiente"]) == "Pagado"
+            medio = e2.selectbox("Metodo de pago", MEDIOS_PAGO)
+            recibido = e3.text_input("Recibido por", placeholder="Ej. GARY",
+                                     help="Queda registrado como 'YAPE GARY'")
+
+            f1, f2, f3 = st.columns(3)
+            es_renovacion = bool(vigente) or bool(db.ultimo_paquete(alumno_id))
+            tipo = f1.selectbox("Renovacion o nuevo", ["NUEVO", "RENOVACION"],
+                                index=1 if es_renovacion else 0)
+            if lista_vendedores:
+                vendedor = f2.selectbox("Vendedor", lista_vendedores + ["Otro..."])
+            else:
+                vendedor = "Otro..."
+            if vendedor == "Otro...":
+                vendedor = f2.text_input("Nombre del vendedor", key="vend_nuevo")
+            pagado = f3.selectbox("Estado del pago", ["Pagado", "Pendiente"]) == "Pagado"
+
             obs = st.text_input("Observacion", placeholder="Opcional")
 
-            st.info(f"**{plan['sesiones']} sesiones** con vigencia del "
+            st.info(f"**{sesiones} sesiones** con vigencia del "
                     f"{inicio.strftime('%d/%m/%Y')} al **{fin.strftime('%d/%m/%Y')}** "
-                    f"({plan['vigencia_dias']} dias).")
+                    f"({vigencia} dias).")
 
-            if st.form_submit_button("Registrar paquete", type="primary"):
+            if st.form_submit_button("Registrar pedido", type="primary"):
+                medio_completo = f"{medio} {recibido}".strip() if recibido else medio
                 try:
-                    db.crear_paquete(alumno_id, plan, inicio, precio, medio, pagado, obs or None)
-                    st.toast(f"Paquete registrado, vence el {fin.strftime('%d/%m/%Y')}", icon="✅")
-                    st.success(f"Paquete registrado. Vence el {fin.strftime('%d/%m/%Y')}.")
+                    db.crear_paquete(
+                        alumno_id, plan, inicio, precio, medio_completo, pagado,
+                        obs or None, fecha_pedido=fecha_pedido, sede=sede,
+                        dias_asiste=" ".join(dias),
+                        vendedor=(vendedor or "").strip().upper() or None,
+                        tipo=tipo, sesiones=int(sesiones), vigencia_dias=int(vigencia))
+                    st.toast(f"Pedido {pedido} registrado", icon="\u2705")
+                    st.success(f"Pedido N {pedido} registrado. "
+                               f"Vence el {fin.strftime('%d/%m/%Y')}.")
                     st.rerun()
                 except Exception as e:
                     st.error(f"No se pudo registrar: {e}")
@@ -635,28 +718,47 @@ def pagina_paquetes() -> None:
         if datos.empty:
             st.info("Sin resultados.")
             return
-        vista = datos[["codigo", "alumno", "plan_nombre", "fecha_inicio", "fecha_fin",
-                       "sesiones_usadas", "sesiones_totales", "sesiones_restantes",
-                       "dias_restantes", "dias_congelados", "precio", "pagado",
-                       "estado_real"]].copy()
-        vista.columns = ["Codigo", "Alumno", "Plan", "Inicio", "Fin", "Usadas", "Totales",
-                         "Restantes", "Dias por vencer", "Dias congelados", "Precio",
-                         "Pagado", "Estado"]
+        columnas = ["nro_pedido", "fecha_pedido", "alumno", "plan_nombre", "precio",
+                    "medio_pago", "fecha_inicio", "fecha_fin", "sede", "dias_asiste",
+                    "sesiones_usadas", "sesiones_totales", "sesiones_restantes",
+                    "dias_restantes", "dias_congelados", "estado_real", "tipo",
+                    "vendedor", "pagado"]
+        # Si la migracion 006 aun no se corrio faltan columnas: avisar sin romper
+        faltan = [c for c in columnas if c not in datos.columns]
+        for c in faltan:
+            datos[c] = None
+        if faltan:
+            st.warning("Faltan campos nuevos en la base. Corre migracion-006.sql en "
+                       "Supabase para tener numero de pedido, sede y vendedor.")
+
+        vista = datos[columnas].copy()
+        vista.columns = ["N pedido", "Fecha", "Cliente", "Plan contratado", "Monto total",
+                         "Metodo de pago", "Inicio del plan", "Fin del plan",
+                         "Sede y turno", "Dias que asiste", "Usadas", "Totales",
+                         "Restantes", "Dias por vencer", "Dias congelados", "Status",
+                         "Renovacion/Nuevo", "Vendedor", "Pagado"]
         vista["Avance"] = (vista["Usadas"] / vista["Totales"].replace(0, 1) * 100)
-        vista = vista[["Codigo", "Alumno", "Plan", "Avance", "Restantes", "Inicio",
-                       "Fin", "Dias por vencer", "Dias congelados", "Precio",
-                       "Pagado", "Estado"]]
-        for col in ("Inicio", "Fin"):
+        vista = vista[["N pedido", "Fecha", "Cliente", "Plan contratado", "Monto total",
+                       "Metodo de pago", "Inicio del plan", "Fin del plan", "Sede y turno",
+                       "Dias que asiste", "Avance", "Restantes", "Dias por vencer",
+                       "Dias congelados", "Status", "Renovacion/Nuevo", "Vendedor",
+                       "Pagado"]]
+        for col in ("Fecha", "Inicio del plan", "Fin del plan"):
             vista[col] = pd.to_datetime(vista[col], errors="coerce")
 
         st.dataframe(
             vista, width="stretch", hide_index=True, height=430,
             column_config={
+                "N pedido": st.column_config.NumberColumn("N pedido", format="%d"),
                 "Avance": st.column_config.ProgressColumn(
                     "Avance", min_value=0, max_value=100, format="%d%%"),
-                "Precio": st.column_config.NumberColumn("Precio", format="S/ %.2f"),
-                "Inicio": st.column_config.DateColumn("Inicio", format="DD/MM/YYYY"),
-                "Fin": st.column_config.DateColumn("Fin", format="DD/MM/YYYY"),
+                "Monto total": st.column_config.NumberColumn(
+                    "Monto total", format="S/ %.2f"),
+                "Fecha": st.column_config.DateColumn("Fecha", format="DD/MM/YYYY"),
+                "Inicio del plan": st.column_config.DateColumn(
+                    "Inicio del plan", format="DD/MM/YYYY"),
+                "Fin del plan": st.column_config.DateColumn(
+                    "Fin del plan", format="DD/MM/YYYY"),
                 "Pagado": st.column_config.CheckboxColumn("Pagado"),
             })
         st.download_button("Descargar CSV", vista.to_csv(index=False).encode("utf-8"),
@@ -903,41 +1005,114 @@ def pagina_planes() -> None:
     theme.cabecera("Planes", fecha_larga(logic.hoy()).upper(), "Catalogo y precios")
 
     planes = db.listar_planes(solo_activos=False)
-    if not planes.empty:
-        vista = planes[["nombre", "sesiones", "vigencia_dias", "precio",
-                        "descripcion", "activo"]].copy()
-        vista.columns = ["Plan", "Sesiones", "Vigencia (dias)", "Precio",
-                         "Descripcion", "Activo"]
-        st.dataframe(vista, width="stretch", hide_index=True)
 
-        st.markdown("**Activar o desactivar**")
-        c1, c2 = st.columns([3, 1])
-        elegido = c1.selectbox("Plan", planes["nombre"].tolist())
-        fila = planes[planes["nombre"] == elegido].iloc[0]
-        etiqueta = "Desactivar" if fila["activo"] else "Activar"
-        if c2.button(etiqueta, width="stretch"):
-            db.actualizar_plan(fila["id"], {"activo": not bool(fila["activo"])})
-            st.rerun()
+    tab_lista, tab_editar, tab_nuevo = st.tabs(
+        ["Catalogo", "Editar un plan", "Crear plan"])
 
-    st.divider()
-    with st.form("form_plan", clear_on_submit=True):
-        st.markdown("**Nuevo plan**")
-        c1, c2, c3, c4 = st.columns(4)
-        nombre = c1.text_input("Nombre")
-        sesiones = c2.number_input("Sesiones", min_value=1, value=12)
-        vigencia = c3.number_input("Vigencia (dias)", min_value=1, value=30)
-        precio = c4.number_input("Precio (S/)", min_value=0.0, value=180.0, step=10.0)
-        desc = st.text_input("Descripcion")
-        if st.form_submit_button("Crear plan", type="primary"):
-            if not nombre:
-                st.error("Ponle un nombre al plan.")
-            else:
-                try:
-                    db.crear_plan(nombre, sesiones, vigencia, precio, desc)
-                    st.success("Plan creado.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"No se pudo crear: {e}")
+    # ---------------------------------------------------------- catalogo
+    with tab_lista:
+        if planes.empty:
+            theme.vacio("Todavia no hay planes",
+                        "Crea el primero en la pestana Crear plan.")
+        else:
+            vista = planes[["nombre", "sesiones", "vigencia_dias", "precio",
+                            "descripcion", "activo"]].copy()
+            vista["por_sesion"] = (vista["precio"] / vista["sesiones"].replace(0, 1))
+            vista.columns = ["Plan", "Sesiones", "Vigencia (dias)", "Precio",
+                             "Descripcion", "Activo", "Costo por sesion"]
+            vista = vista[["Plan", "Sesiones", "Vigencia (dias)", "Precio",
+                           "Costo por sesion", "Descripcion", "Activo"]]
+            st.dataframe(
+                vista, width="stretch", hide_index=True,
+                column_config={
+                    "Precio": st.column_config.NumberColumn("Precio", format="S/ %.2f"),
+                    "Costo por sesion": st.column_config.NumberColumn(
+                        "Costo por sesion", format="S/ %.2f",
+                        help="Sirve para comparar si el plan largo conviene"),
+                    "Activo": st.column_config.CheckboxColumn("Activo"),
+                })
+            st.caption("Los planes desactivados no aparecen al vender, pero los alumnos "
+                       "que ya los tienen los siguen usando hasta agotarlos.")
+
+    # ------------------------------------------------------------ editar
+    with tab_editar:
+        if planes.empty:
+            theme.vacio("Nada que editar", "Primero crea un plan.")
+        else:
+            elegido = st.selectbox("Plan a editar", planes["nombre"].tolist(),
+                                   key="plan_editar")
+            fila = planes[planes["nombre"] == elegido].iloc[0]
+
+            try:
+                usos = db.paquetes_con_plan(fila["id"])
+            except Exception:
+                usos = 0
+            if usos:
+                st.info(f"Este plan se vendio {usos} {'vez' if usos == 1 else 'veces'}. "
+                        "Cambiarlo no altera esas ventas: cada paquete guarda las "
+                        "sesiones y el precio con los que se cobro.")
+
+            with st.form("form_editar_plan"):
+                c1, c2, c3 = st.columns([2, 1, 1])
+                nombre = c1.text_input("Nombre", value=str(fila["nombre"]))
+                sesiones = c2.number_input("Sesiones", min_value=1,
+                                           value=int(fila["sesiones"]))
+                vigencia = c3.number_input("Vigencia (dias)", min_value=1,
+                                           value=int(fila["vigencia_dias"]))
+
+                d1, d2 = st.columns([1, 1])
+                precio = d1.number_input("Precio (S/)", min_value=0.0,
+                                         value=float(fila["precio"]), step=10.0)
+                activo = d2.selectbox("Estado", ["Activo", "Desactivado"],
+                                      index=0 if bool(fila["activo"]) else 1) == "Activo"
+                desc = st.text_input("Descripcion",
+                                     value=str(fila["descripcion"] or ""))
+
+                if sesiones:
+                    st.caption(f"Costo por sesion: S/ {precio / sesiones:.2f}")
+
+                if st.form_submit_button("Guardar cambios", type="primary"):
+                    try:
+                        db.actualizar_plan(fila["id"], {
+                            "nombre": nombre.strip().upper(),
+                            "sesiones": int(sesiones),
+                            "vigencia_dias": int(vigencia),
+                            "precio": float(precio),
+                            "descripcion": desc or None,
+                            "activo": activo,
+                        })
+                        st.toast("Plan actualizado", icon="\u2705")
+                        st.success("Plan actualizado.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"No se pudo guardar: {e}")
+
+    # ------------------------------------------------------------- crear
+    with tab_nuevo:
+        with st.form("form_plan", clear_on_submit=True):
+            c1, c2, c3, c4 = st.columns([2.2, 1, 1, 1])
+            nombre = c1.text_input("Nombre del plan",
+                                   placeholder="PLAN BASICO 36 SESIONES 3 MESES PROMO")
+            sesiones = c2.number_input("Sesiones", min_value=1, value=12)
+            vigencia = c3.number_input("Vigencia (dias)", min_value=1, value=30,
+                                       help="30 = un mes, 90 = tres meses")
+            precio = c4.number_input("Precio (S/)", min_value=0.0, value=180.0, step=10.0)
+            desc = st.text_input("Descripcion",
+                                 placeholder="3 sesiones por semana durante un mes")
+
+            st.caption(f"Costo por sesion: S/ {precio / max(1, sesiones):.2f}")
+
+            if st.form_submit_button("Crear plan", type="primary"):
+                if not nombre.strip():
+                    st.error("Ponle un nombre al plan.")
+                else:
+                    try:
+                        db.crear_plan(nombre, sesiones, vigencia, precio, desc or None)
+                        st.toast("Plan creado", icon="\u2705")
+                        st.success(f"Plan creado: {nombre.strip().upper()}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"No se pudo crear: {e}")
 
 
 # =====================================================================
