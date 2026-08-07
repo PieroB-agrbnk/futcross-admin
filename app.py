@@ -23,6 +23,10 @@ import theme       # noqa: E402
 
 theme.aplicar_estilos()
 
+# Se muestra en la barra lateral. Sirve para saber de un vistazo si la version
+# que estas viendo en la nube es la misma que tienes en tu computadora.
+VERSION = "1.7"
+
 DIAS_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
 TURNOS = ["MANANA", "TARDE", "NOCHE"]
 MEDIOS_PAGO = ["YAPE", "PLIN", "EFECTIVO", "TRANSFERENCIA", "TARJETA", "OTRO"]
@@ -396,10 +400,11 @@ def pagina_alumnos() -> None:
     theme.cabecera("Alumnos", fecha_larga(logic.hoy()).upper(), "Padron")
 
     if es_admin():
-        tab_lista, tab_nuevo = st.tabs(["Lista", "Inscribir alumno"])
+        tab_lista, tab_nuevo, tab_editar = st.tabs(
+            ["Lista", "Inscribir alumno", "Editar alumno"])
     else:
         (tab_lista,) = st.tabs(["Lista"])
-        tab_nuevo = None
+        tab_nuevo = tab_editar = None
 
     with tab_lista:
         col_a, col_b = st.columns([2, 1])
@@ -451,6 +456,9 @@ def pagina_alumnos() -> None:
 
     if tab_nuevo is None:
         return
+
+    with tab_editar:
+        editar_alumno()
 
     with tab_nuevo:
         with st.form("form_alumno", clear_on_submit=True):
@@ -508,6 +516,108 @@ def pagina_alumnos() -> None:
                                    "Ahora asignale un paquete en la pantalla Paquetes.")
                     except Exception as e:
                         st.error(f"No se pudo guardar: {e}")
+
+
+def editar_alumno() -> None:
+    """Modifica los datos de un alumno ya inscrito.
+
+    Todo llega precargado con lo que ya tiene, asi que solo se toca lo que
+    cambia. Tambien permite darlo de baja sin borrar su historial.
+    """
+    todos = db.panel_alumnos(solo_activos=False)
+    if todos.empty:
+        theme.vacio("No hay alumnos", "Primero inscribe a alguien.")
+        return
+
+    etiquetas = {f"{r['codigo']} - {r['alumno']}": r["alumno_id"]
+                 for _, r in todos.iterrows()}
+    elegido = st.selectbox("Alumno a editar", list(etiquetas.keys()),
+                           key="alumno_editar")
+    alumno_id = etiquetas[elegido]
+
+    a = db.alumno(alumno_id)
+    if not a:
+        st.error("No se encontro el alumno.")
+        return
+
+    def texto(clave, defecto=""):
+        valor = a.get(clave)
+        return defecto if valor is None or (isinstance(valor, float) and pd.isna(valor)) \
+            else str(valor)
+
+    try:
+        opciones_sede = db.sedes()
+    except Exception:
+        opciones_sede = ["SURQUILLO"]
+    sede_actual = texto("sede") or (opciones_sede[0] if opciones_sede else "SURQUILLO")
+    if sede_actual not in opciones_sede:
+        opciones_sede = [sede_actual] + opciones_sede
+
+    turno_actual = texto("turno") or TURNOS[0]
+    dias_actuales = [d for d in texto("dias_asiste").split() if d in DIAS_SEMANA]
+
+    with st.form("form_editar_alumno"):
+        c1, c2 = st.columns(2)
+        nombres = c1.text_input("Nombres *", value=texto("nombres"))
+        apellidos = c2.text_input("Apellidos *", value=texto("apellidos"))
+        dni = c1.text_input("DNI", value=texto("dni"))
+        telefono = c2.text_input("Telefono", value=texto("telefono"))
+        email = c1.text_input("Correo", value=texto("email"))
+
+        nac = logic.a_fecha(a.get("fecha_nacimiento"))
+        nacimiento = c2.date_input("Fecha de nacimiento", value=nac,
+                                   min_value=logic.hoy() - timedelta(days=365 * 80),
+                                   max_value=logic.hoy(), format="DD/MM/YYYY")
+
+        st.markdown("**Donde y cuando entrena**")
+        d1, d2, d3 = st.columns([1.2, 1, 2])
+        sede = d1.selectbox("Sede", opciones_sede,
+                            index=opciones_sede.index(sede_actual))
+        turno = d2.selectbox("Turno", TURNOS,
+                             index=TURNOS.index(turno_actual)
+                             if turno_actual in TURNOS else 0)
+        dias = d3.multiselect("Dias que asiste", DIAS_SEMANA, default=dias_actuales)
+        horario = st.text_input("Hora exacta", value=texto("horario"))
+
+        e1, e2 = st.columns(2)
+        emergencia = e1.text_input("Contacto de emergencia",
+                                   value=texto("contacto_emergencia"))
+        activo = e2.selectbox(
+            "Estado del alumno", ["Activo", "Dado de baja"],
+            index=0 if a.get("activo", True) else 1,
+            help="Dar de baja lo saca de los listados pero conserva su historial",
+        ) == "Activo"
+        notas = st.text_area("Notas", value=texto("notas"))
+
+        st.caption(f"Codigo {a['codigo']} - inscrito el "
+                   f"{logic.a_fecha(a['fecha_inscripcion']).strftime('%d/%m/%Y')}. "
+                   "El codigo y la fecha de inscripcion no se modifican.")
+
+        if st.form_submit_button("Guardar cambios", type="primary"):
+            if not nombres.strip() or not apellidos.strip():
+                st.error("Nombres y apellidos son obligatorios.")
+            else:
+                try:
+                    db.actualizar_alumno(alumno_id, {
+                        "nombres": nombres.strip().title(),
+                        "apellidos": apellidos.strip().title(),
+                        "dni": logic.solo_digitos(dni) or None,
+                        "telefono": logic.solo_digitos(telefono) or None,
+                        "email": email.strip() or None,
+                        "fecha_nacimiento": nacimiento,
+                        "sede": sede,
+                        "turno": turno,
+                        "dias_asiste": " ".join(dias),
+                        "horario": horario or None,
+                        "contacto_emergencia": emergencia or None,
+                        "notas": notas or None,
+                        "activo": activo,
+                    })
+                    st.toast("Alumno actualizado", icon="\u2705")
+                    st.success(f"Datos de {nombres} {apellidos} actualizados.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"No se pudo guardar: {e}")
 
 
 def ficha_alumno(alumno_id: str) -> None:
@@ -1190,8 +1300,10 @@ def menu_lateral() -> str:
         st.divider()
         st.markdown(
             f'<div class="menu-grupo" style="margin:0 0 .2rem">Sesion</div>'
-            f'<div style="font-size:.8rem;color:#C7CBD1;margin-bottom:.5rem">'
-            f'{ETIQUETA_ROL.get(rol(), "")}</div>',
+            f'<div style="font-size:.8rem;color:#C7CBD1;margin-bottom:.15rem">'
+            f'{ETIQUETA_ROL.get(rol(), "")}</div>'
+            f'<div style="font-size:.68rem;color:#5F656D;margin-bottom:.5rem">'
+            f'Version {VERSION}</div>',
             unsafe_allow_html=True)
         if st.button("Cerrar sesion", key="salir", width="stretch"):
             st.session_state.pop("rol", None)
