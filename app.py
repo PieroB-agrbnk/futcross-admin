@@ -25,7 +25,7 @@ theme.aplicar_estilos()
 
 # Se muestra en la barra lateral. Sirve para saber de un vistazo si la version
 # que estas viendo en la nube es la misma que tienes en tu computadora.
-VERSION = "2.0"
+VERSION = "2.1"
 
 DIAS_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
 TURNOS = ["MANANA", "TARDE", "NOCHE"]
@@ -449,16 +449,17 @@ def pagina_alumnos() -> None:
 
             vista = datos[["codigo", "alumno", "telefono", "plan_nombre",
                            "sesiones_usadas", "sesiones_totales",
-                           "sesiones_restantes", "fecha_fin", "estado_real",
-                           "fecha_inscripcion"]].copy()
+                           "sesiones_restantes", "fecha_inicio", "fecha_fin",
+                           "estado_real", "fecha_inscripcion"]].copy()
             vista["avance"] = (vista["sesiones_usadas"].fillna(0)
                                / vista["sesiones_totales"].replace(0, 1) * 100).fillna(0)
             vista = vista.drop(columns=["sesiones_usadas", "sesiones_totales"])
             vista.columns = ["Codigo", "Alumno", "Telefono", "Plan", "Restantes",
-                             "Vence", "Estado", "Inscrito", "Avance"]
+                             "Inicio del plan", "Vence", "Estado", "Inscrito", "Avance"]
             vista = vista[["Codigo", "Alumno", "Telefono", "Plan", "Avance",
-                           "Restantes", "Vence", "Estado", "Inscrito"]]
-            for col in ("Vence", "Inscrito"):
+                           "Restantes", "Inicio del plan", "Vence", "Estado",
+                           "Inscrito"]]
+            for col in ("Inicio del plan", "Vence", "Inscrito"):
                 vista[col] = pd.to_datetime(vista[col], errors="coerce")
 
             st.dataframe(
@@ -468,8 +469,15 @@ def pagina_alumnos() -> None:
                         "Avance", min_value=0, max_value=100, format="%d%%",
                         help="Sesiones usadas del paquete"),
                     "Restantes": st.column_config.NumberColumn("Restantes", format="%d"),
-                    "Vence": st.column_config.DateColumn("Vence", format="DD/MM/YYYY"),
-                    "Inscrito": st.column_config.DateColumn("Inscrito", format="DD/MM/YYYY"),
+                    "Inicio del plan": st.column_config.DateColumn(
+                        "Inicio del plan", format="DD/MM/YYYY",
+                        help="Cuando arranca el plan, no cuando se inscribio"),
+                    "Vence": st.column_config.DateColumn(
+                        "Vence", format="DD/MM/YYYY",
+                        help="Fecha de su ultima sesion"),
+                    "Inscrito": st.column_config.DateColumn(
+                        "Inscrito", format="DD/MM/YYYY",
+                        help="Cuando se registro en la academia"),
                 })
             st.download_button("Descargar CSV", vista.to_csv(index=False).encode("utf-8"),
                                "futcross_alumnos.csv", "text/csv")
@@ -745,6 +753,29 @@ def ficha_alumno(alumno_id: str) -> None:
     else:
         c2.metric("Sesiones restantes", "—")
         c3.metric("Vence", "—")
+
+    if vigente is not None and not vigente.empty:
+        pv = vigente.iloc[0]
+        dias_pv = pv.get("dias_asiste")
+        if dias_pv and not pd.isna(dias_pv):
+            usadas_pv = int(pv["sesiones_usadas"])
+            totales_pv = int(pv["sesiones_totales"])
+            todas = logic.proximas_sesiones(logic.a_fecha(pv["fecha_inicio"]),
+                                            totales_pv, dias_pv)
+            if todas:
+                with st.expander(
+                        f"Cronograma de sus {totales_pv} sesiones "
+                        f"({logic.frecuencia(dias_pv)})"):
+                    filas = []
+                    for n, f in enumerate(todas, 1):
+                        estado = "usada" if n <= usadas_pv else "pendiente"
+                        filas.append({"N": n,
+                                      "Fecha": fecha_larga(f).title(),
+                                      "Estado": estado})
+                    st.dataframe(pd.DataFrame(filas), width="stretch",
+                                 hide_index=True, height=260)
+                    st.caption(f"Primera sesion el {fecha_larga(todas[0])}, "
+                               f"ultima el {fecha_larga(todas[-1])}.")
 
     if not paquetes.empty:
         st.markdown("**Historial de paquetes**")
