@@ -2,7 +2,7 @@
 title: FutCross Admin
 emoji: "🟠"
 colorFrom: gray
-colorTo: orange
+colorTo: yellow
 sdk: streamlit
 app_file: app.py
 pinned: false
