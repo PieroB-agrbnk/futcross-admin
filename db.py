@@ -85,6 +85,22 @@ def plan(plan_id: str) -> dict | None:
     return r[0] if r else None
 
 
+def eliminar_plan(plan_id: str) -> None:
+    """Borra el plan del catalogo.
+
+    Solo si nunca se vendio. Si ya tiene pedidos, borrarlo dejaria esos
+    pedidos apuntando a un plan que no existe, asi que en ese caso se
+    desactiva: desaparece al vender pero el historial queda intacto.
+    """
+    usos = paquetes_con_plan(plan_id)
+    if usos:
+        raise ValueError(
+            f"Este plan ya se vendio {usos} {'vez' if usos == 1 else 'veces'}. "
+            "No se puede borrar sin romper esos pedidos. Usa 'Ocultar del catalogo'."
+        )
+    _tabla("planes").delete().eq("id", plan_id).execute()
+
+
 def paquetes_con_plan(plan_id: str) -> int:
     """Cuantas ventas usan este plan. Sirve para avisar antes de editarlo."""
     r = (_tabla("paquetes").select("id", count="exact")

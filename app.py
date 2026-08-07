@@ -25,7 +25,7 @@ theme.aplicar_estilos()
 
 # Se muestra en la barra lateral. Sirve para saber de un vistazo si la version
 # que estas viendo en la nube es la misma que tienes en tu computadora.
-VERSION = "1.9"
+VERSION = "2.0"
 
 DIAS_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
 TURNOS = ["MANANA", "TARDE", "NOCHE"]
@@ -514,6 +514,47 @@ def pagina_alumnos() -> None:
             emergencia = c2.text_input("Contacto de emergencia")
             notas = st.text_area("Notas", placeholder="Lesiones previas, observaciones, etc.")
 
+            # Un alumno nuevo casi siempre entra comprando. Se hace en el mismo
+            # paso para no obligar a ir despues a la pantalla de Paquetes.
+            st.markdown("**Plan que contrata**")
+            planes_disp = db.listar_planes()
+            vender_ahora = st.checkbox("Registrar su primer pedido ahora",
+                                       value=not planes_disp.empty,
+                                       disabled=planes_disp.empty)
+            if planes_disp.empty:
+                st.caption("No hay planes activos. Crealos en la pantalla Planes.")
+
+            plan_elegido = None
+            inicio_plan = precio_plan = medio_plan = vendedor_plan = None
+            if not planes_disp.empty:
+                q1, q2 = st.columns([2, 1])
+                nombre_plan = q1.selectbox("Plan", planes_disp["nombre"].tolist())
+                plan_elegido = planes_disp[
+                    planes_disp["nombre"] == nombre_plan].iloc[0].to_dict()
+                inicio_plan = q2.date_input("Inicio del plan", value=logic.hoy(),
+                                            format="DD/MM/YYYY")
+
+                fin_plan = logic.fecha_fin_por_calendario(
+                    inicio_plan, int(plan_elegido["sesiones"]), dias_grupo,
+                    int(plan_elegido["vigencia_dias"]))
+                if dias_grupo:
+                    st.caption(
+                        f"{plan_elegido['sesiones']} sesiones entrenando "
+                        f"{logic.frecuencia(dias_grupo)}. Ultima sesion el "
+                        f"{fecha_larga(fin_plan)}."
+                    )
+
+                r1, r2, r3 = st.columns(3)
+                precio_plan = r1.number_input("Monto cobrado (S/)", min_value=0.0,
+                                              value=float(plan_elegido["precio"]),
+                                              step=10.0)
+                medio_plan = r2.selectbox("Metodo de pago", MEDIOS_PAGO,
+                                          key="medio_inscripcion")
+                recibido_plan = r3.text_input("Recibido por", placeholder="Ej. GARY",
+                                              key="recibido_inscripcion")
+                vendedor_plan = st.text_input("Vendedor", key="vendedor_inscripcion",
+                                              placeholder="Ej. EDDIMAR")
+
             if st.form_submit_button("Guardar alumno", type="primary"):
                 if not nombres or not apellidos:
                     st.error("Nombres y apellidos son obligatorios.")
@@ -531,8 +572,29 @@ def pagina_alumnos() -> None:
                             "dias_asiste": dias_grupo,
                             "contacto_emergencia": emergencia, "notas": notas,
                         })
-                        st.success(f"Alumno registrado con codigo {creado[0]['codigo']}. "
-                                   "Ahora asignale un paquete en la pantalla Paquetes.")
+                        alumno_nuevo = creado[0]
+                        aviso = f"Alumno registrado con codigo {alumno_nuevo['codigo']}."
+
+                        if vender_ahora and plan_elegido:
+                            medio_full = (f"{medio_plan} {recibido_plan}".strip()
+                                          if recibido_plan else medio_plan)
+                            db.crear_paquete(
+                                alumno_nuevo["id"], plan_elegido, inicio_plan,
+                                precio_plan, medio_full, True, None,
+                                fecha_pedido=logic.hoy(), sede=None,
+                                dias_asiste=dias_grupo,
+                                vendedor=(vendedor_plan or "").strip().upper() or None,
+                                tipo="NUEVO", grupo_id=grupo_id)
+                            fin_final = logic.fecha_fin_por_calendario(
+                                inicio_plan, int(plan_elegido["sesiones"]), dias_grupo,
+                                int(plan_elegido["vigencia_dias"]))
+                            aviso += (f" Se registro su {plan_elegido['nombre']}: "
+                                      f"ultima sesion el {fecha_larga(fin_final)}.")
+                        else:
+                            aviso += " Asignale un paquete en la pantalla Paquetes."
+
+                        st.toast("Alumno registrado", icon="\u2705")
+                        st.success(aviso)
                     except Exception as e:
                         st.error(f"No se pudo guardar: {e}")
 
@@ -1227,6 +1289,31 @@ def pagina_planes() -> None:
                         st.rerun()
                     except Exception as e:
                         st.error(f"No se pudo guardar: {e}")
+
+            st.divider()
+            st.markdown("**Sacarlo del catalogo**")
+            g1, g2 = st.columns(2)
+
+            etiqueta = "Ocultar del catalogo" if fila["activo"] else "Volver a mostrar"
+            if g1.button(etiqueta, width="stretch", key="ocultar_plan"):
+                db.actualizar_plan(fila["id"], {"activo": not bool(fila["activo"])})
+                st.toast("Catalogo actualizado", icon="\u2705")
+                st.rerun()
+            g1.caption("Deja de aparecer al vender. Los alumnos que ya lo tienen "
+                       "lo siguen usando y el historial queda intacto.")
+
+            confirmar = g2.checkbox("Confirmo que quiero borrarlo",
+                                    key="confirmar_borrar_plan")
+            if g2.button("Eliminar definitivamente", width="stretch",
+                         disabled=not confirmar, key="borrar_plan"):
+                try:
+                    db.eliminar_plan(fila["id"])
+                    st.toast("Plan eliminado", icon="\u2705")
+                    st.success(f"Plan {fila['nombre']} eliminado del catalogo.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+            g2.caption("Solo se puede si el plan nunca se vendio.")
 
     # ------------------------------------------------------------- crear
     with tab_nuevo:
