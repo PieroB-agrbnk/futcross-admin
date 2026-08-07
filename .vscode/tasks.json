@@ -1,0 +1,17 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Instalar dependencias",
+      "type": "shell",
+      "command": ".venv\\Scripts\\python.exe -m pip install -r requirements.txt",
+      "problemMatcher": []
+    },
+    {
+      "label": "Abrir el panel",
+      "type": "shell",
+      "command": ".venv\\Scripts\\streamlit.exe run app.py",
+      "problemMatcher": []
+    }
+  ]
+}

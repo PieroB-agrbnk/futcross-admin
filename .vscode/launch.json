@@ -1,0 +1,29 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Streamlit: abrir el panel",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "streamlit",
+      "args": ["run", "app.py"],
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Streamlit: cargar datos de prueba",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "streamlit",
+      "args": ["run", "seed_demo.py"],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Probar las reglas de negocio",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "test_logic.py",
+      "console": "integratedTerminal"
+    }
+  ]
+}
