@@ -25,7 +25,7 @@ theme.aplicar_estilos()
 
 # Se muestra en la barra lateral. Sirve para saber de un vistazo si la version
 # que estas viendo en la nube es la misma que tienes en tu computadora.
-VERSION = "2.3"
+VERSION = "2.4"
 
 DIAS_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
 TURNOS = ["MANANA", "TARDE", "NOCHE"]
@@ -483,6 +483,11 @@ def pagina_alumnos() -> None:
             for col in ("Inicio del plan", "Vence", "Inscrito"):
                 vista[col] = pd.to_datetime(vista[col], errors="coerce")
 
+            # Un paquete congelado no tiene fecha de vencimiento valida: la
+            # que quedo guardada es la de antes de la pausa y se va a
+            # recalcular al reactivarlo. Mostrarla induce a error.
+            vista.loc[vista["Estado"] == "CONGELADO", "Vence"] = pd.NaT
+
             st.dataframe(
                 vista, width="stretch", hide_index=True, height=420,
                 column_config={
@@ -500,6 +505,12 @@ def pagina_alumnos() -> None:
                         "Inscrito", format="DD/MM/YYYY",
                         help="Cuando se registro en la academia"),
                 })
+            if (vista["Estado"] == "CONGELADO").any():
+                st.caption(
+                    "Los alumnos congelados no muestran vencimiento a proposito: "
+                    "esa fecha se recalcula el dia que se les da de alta, contando "
+                    "las sesiones que les quedan."
+                )
             st.download_button("Descargar CSV", vista.to_csv(index=False).encode("utf-8"),
                                "futcross_alumnos.csv", "text/csv")
 
@@ -1541,6 +1552,17 @@ def main() -> None:
     if not hay_sesion():
         pantalla_login()
         return
+
+    # Altas automaticas: los congelamientos cuya fecha prevista ya llego.
+    # Corre una vez por sesion; en la base ademas corre solo cada noche.
+    if not st.session_state.get("altas_revisadas"):
+        st.session_state["altas_revisadas"] = True
+        try:
+            n = db.reactivar_automaticos()
+            if n:
+                st.toast(f"{n} alumno(s) reactivados automaticamente", icon="\u2705")
+        except Exception:
+            pass
 
     PAGINAS_ADMIN[menu_lateral()]()
 

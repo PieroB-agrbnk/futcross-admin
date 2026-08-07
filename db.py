@@ -392,6 +392,21 @@ def congelamientos(activos: bool | None = True) -> pd.DataFrame:
     return _df(rows)
 
 
+def reactivar_automaticos() -> int:
+    """Da de alta los congelamientos cuya fecha prevista ya llego.
+
+    La misma funcion corre sola en la base todas las noches (pg_cron). Esto
+    la ejecuta ademas al abrir el panel, para que el efecto se vea al
+    instante y no haya que esperar al dia siguiente.
+    """
+    try:
+        r = supabase().rpc("fc_reactivar_previstos", {}).execute()
+        return int(r.data or 0)
+    except Exception:
+        # Si la migracion 014 aun no se corrio, no pasa nada
+        return 0
+
+
 def congelados_que_vuelven(hasta: date) -> pd.DataFrame:
     """Congelamientos cuya fecha prevista de alta ya llego o esta por llegar."""
     try:
