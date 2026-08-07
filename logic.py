@@ -235,3 +235,104 @@ def mensaje_renovacion(nombre: str, motivo: str, plan: str = "") -> str:
     if "Vencio" in motivo or "vencid" in motivo.lower() or "agotad" in motivo.lower():
         return base + "Tu paquete ya termino y te extranamos en la cancha. Renuevalo y seguimos entrenando."
     return base + f"Ojo que {motivo.lower()}. Renueva a tiempo y no pierdes el ritmo. Nos vemos en la cancha."
+
+
+# ---------------------------------------------------------------------
+# Calendario de entrenamiento
+#
+# FutCross no vende "30 dias": vende sesiones que caen en dias fijos.
+# Un plan de 12 sesiones que arranca el lunes 3 de agosto con grupo de
+# lunes, miercoles y viernes termina el viernes 28, no "30 dias despues".
+# Por eso la fecha de fin se calcula recorriendo el calendario real.
+# ---------------------------------------------------------------------
+INDICE_DIA = {"LUN": 0, "MAR": 1, "MIE": 2, "JUE": 3, "VIE": 4, "SAB": 5, "DOM": 6}
+NOMBRE_DIA = {v: k for k, v in INDICE_DIA.items()}
+
+
+def dias_a_indices(dias) -> list[int]:
+    """Acepta 'LUN MIE VIE' o ['LUN','MIE','VIE'] y devuelve [0, 2, 4]."""
+    if not dias:
+        return []
+    if isinstance(dias, str):
+        dias = dias.replace(",", " ").split()
+    vistos = {INDICE_DIA[d.strip().upper()[:3]]
+              for d in dias if d.strip().upper()[:3] in INDICE_DIA}
+    return sorted(vistos)
+
+
+def es_dia_de_entrenamiento(fecha: date, dias) -> bool:
+    return fecha.weekday() in dias_a_indices(dias)
+
+
+def fecha_de_sesion(inicio: date, numero: int, dias) -> date | None:
+    """Fecha en la que cae la sesion numero N.
+
+    Cuenta desde `inicio` inclusive: si el inicio cae en un dia de
+    entrenamiento, ese dia es la sesion 1.
+    """
+    indices = dias_a_indices(dias)
+    if not indices or numero < 1:
+        return None
+
+    fecha = inicio
+    contadas = 0
+    # Tope de seguridad: 5 anios. Ningun plan real llega ni cerca.
+    for _ in range(365 * 5):
+        if fecha.weekday() in indices:
+            contadas += 1
+            if contadas == numero:
+                return fecha
+        fecha += timedelta(days=1)
+    return None
+
+
+def fecha_fin_por_calendario(inicio: date, sesiones: int, dias,
+                             vigencia_dias: int | None = None) -> date:
+    """Fecha de la ultima sesion del plan.
+
+    Si el grupo no tiene dias definidos, cae en el metodo viejo de contar
+    dias corridos, para que nada quede sin fecha de fin.
+    """
+    fin = fecha_de_sesion(inicio, sesiones, dias)
+    if fin:
+        return fin
+    return fecha_fin_plan(inicio, vigencia_dias or 30)
+
+
+def proximas_sesiones(inicio: date, cantidad: int, dias) -> list:
+    """Las fechas exactas de las proximas N sesiones. Para mostrar el
+    cronograma al alumno cuando compra."""
+    indices = dias_a_indices(dias)
+    if not indices or cantidad < 1:
+        return []
+
+    fechas, fecha = [], inicio
+    for _ in range(365 * 5):
+        if fecha.weekday() in indices:
+            fechas.append(fecha)
+            if len(fechas) == cantidad:
+                break
+        fecha += timedelta(days=1)
+    return fechas
+
+
+def sesiones_entre(desde: date, hasta: date, dias) -> int:
+    """Cuantas sesiones caen en un rango. Sirve para calcular cuantas se
+    perdio un alumno mientras estuvo congelado."""
+    indices = dias_a_indices(dias)
+    if not indices or hasta < desde:
+        return 0
+    total, fecha = 0, desde
+    while fecha <= hasta:
+        if fecha.weekday() in indices:
+            total += 1
+        fecha += timedelta(days=1)
+    return total
+
+
+def frecuencia(dias) -> str:
+    """'LUN MIE VIE' -> '3 veces por semana'."""
+    n = len(dias_a_indices(dias))
+    if n == 0:
+        return "sin dias definidos"
+    return "1 vez por semana" if n == 1 else f"{n} veces por semana"

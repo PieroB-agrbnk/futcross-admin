@@ -25,7 +25,7 @@ theme.aplicar_estilos()
 
 # Se muestra en la barra lateral. Sirve para saber de un vistazo si la version
 # que estas viendo en la nube es la misma que tienes en tu computadora.
-VERSION = "1.8"
+VERSION = "1.9"
 
 DIAS_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
 TURNOS = ["MANANA", "TARDE", "NOCHE"]
@@ -34,6 +34,30 @@ MEDIOS_PAGO = ["YAPE", "PLIN", "EFECTIVO", "TRANSFERENCIA", "TARJETA", "OTRO"]
 MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio",
          "julio", "agosto", "setiembre", "octubre", "noviembre", "diciembre"]
 DIAS = ["lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo"]
+
+
+def selector_de_grupo(etiqueta="Grupo", clave=None, grupo_actual=None):
+    """Devuelve (grupo_id, dias, texto). Los grupos son sede + horario + genero,
+    y de ahi salen los dias de entrenamiento que definen el vencimiento."""
+    grupos = db.listar_grupos()
+    if grupos.empty:
+        st.warning("No hay grupos cargados. Corre migracion-009.sql en Supabase.")
+        return None, "", ""
+
+    opciones = {
+        f"{g['nombre']} - {g['genero'].title()} ({g['dias']})": g
+        for _, g in grupos.iterrows()
+    }
+    llaves = list(opciones.keys())
+    indice = 0
+    if grupo_actual:
+        for i, k in enumerate(llaves):
+            if opciones[k]["id"] == grupo_actual:
+                indice = i
+                break
+    elegido = st.selectbox(etiqueta, llaves, index=indice, key=clave)
+    g = opciones[elegido]
+    return g["id"], g["dias"], f"{g['sede']} {g['hora']} - {logic.frecuencia(g['dias'])}"
 
 
 def fecha_larga(d) -> str:
@@ -480,19 +504,12 @@ def pagina_alumnos() -> None:
                                         placeholder="se toma la de hoy")
             inscripcion = logic.hoy()
 
-            st.markdown("**Donde y cuando entrena**")
-            d1, d2, d3 = st.columns([1.2, 1, 2])
-            try:
-                opciones_sede = db.sedes()
-            except Exception:
-                opciones_sede = ["SURQUILLO"]
-            sede = d1.selectbox("Sede", opciones_sede + ["Otra..."])
-            if sede == "Otra...":
-                sede = d1.text_input("Nombre de la sede nueva", key="sede_nueva")
-            turno = d2.selectbox("Turno", TURNOS)
-            dias = d3.multiselect("Dias que asiste", DIAS_SEMANA,
-                                  default=["LUN", "MIE", "VIE"])
-            horario = st.text_input("Hora exacta", placeholder="8:00 p.m.")
+            st.markdown("**Grupo al que entra**")
+            grupo_id, dias_grupo, detalle = selector_de_grupo(
+                "Sede, horario y genero", clave="grupo_nuevo_alumno")
+            if detalle:
+                st.caption(detalle)
+            sede = dias = horario = turno = None
 
             emergencia = c2.text_input("Contacto de emergencia")
             notas = st.text_area("Notas", placeholder="Lesiones previas, observaciones, etc.")
@@ -510,10 +527,8 @@ def pagina_alumnos() -> None:
                             "email": email.strip() or None,
                             "fecha_nacimiento": nacimiento,
                             "fecha_inscripcion": inscripcion,
-                            "sede": sede,
-                            "turno": turno,
-                            "dias_asiste": " ".join(dias),
-                            "horario": horario,
+                            "grupo_id": grupo_id,
+                            "dias_asiste": dias_grupo,
                             "contacto_emergencia": emergencia, "notas": notas,
                         })
                         st.success(f"Alumno registrado con codigo {creado[0]['codigo']}. "
@@ -573,15 +588,13 @@ def editar_alumno() -> None:
                                    min_value=logic.hoy() - timedelta(days=365 * 80),
                                    max_value=logic.hoy(), format="DD/MM/YYYY")
 
-        st.markdown("**Donde y cuando entrena**")
-        d1, d2, d3 = st.columns([1.2, 1, 2])
-        sede = d1.selectbox("Sede", opciones_sede,
-                            index=opciones_sede.index(sede_actual))
-        turno = d2.selectbox("Turno", TURNOS,
-                             index=TURNOS.index(turno_actual)
-                             if turno_actual in TURNOS else 0)
-        dias = d3.multiselect("Dias que asiste", DIAS_SEMANA, default=dias_actuales)
-        horario = st.text_input("Hora exacta", value=texto("horario"))
+        st.markdown("**Grupo**")
+        grupo_id, dias_grupo, detalle = selector_de_grupo(
+            "Sede, horario y genero", clave="grupo_editar",
+            grupo_actual=a.get("grupo_id"))
+        if detalle:
+            st.caption(detalle)
+        sede = turno = horario = None
 
         e1, e2 = st.columns(2)
         emergencia = e1.text_input("Contacto de emergencia",
@@ -609,10 +622,8 @@ def editar_alumno() -> None:
                         "telefono": logic.solo_digitos(telefono) or None,
                         "email": email.strip() or None,
                         "fecha_nacimiento": nacimiento,
-                        "sede": sede,
-                        "turno": turno,
-                        "dias_asiste": " ".join(dias),
-                        "horario": horario or None,
+                        "grupo_id": grupo_id,
+                        "dias_asiste": dias_grupo,
                         "contacto_emergencia": emergencia or None,
                         "notas": notas or None,
                         "activo": activo,
@@ -763,30 +774,29 @@ def pagina_paquetes() -> None:
                                        format="DD/MM/YYYY",
                                        help="Puede ser posterior a la fecha del pedido")
 
-                # Se puede ajustar el plan para una venta puntual sin tocar el catalogo
+                st.markdown("**Grupo**")
+                grupo_previo = datos_alumno.get("grupo_id")
+                if grupo_previo is not None and pd.isna(grupo_previo):
+                    grupo_previo = None
+                grupo_id, dias_grupo, detalle = selector_de_grupo(
+                    "Sede, horario y genero", clave="grupo_venta",
+                    grupo_actual=grupo_previo)
+                if detalle:
+                    st.caption(detalle)
+
+                # Ajuste para una venta puntual, sin tocar el catalogo de planes
                 a1, a2 = st.columns(2)
                 sesiones = a1.number_input("Sesiones", min_value=1,
                                            value=int(plan["sesiones"]),
                                            help="Cambialo solo si esta venta es una excepcion")
-                vigencia = a2.number_input("Dias de vigencia", min_value=1,
-                                           value=int(plan["vigencia_dias"]))
-                fin = logic.fecha_fin_plan(inicio, int(vigencia))
+                vigencia = a2.number_input("Dias de vigencia (respaldo)", min_value=1,
+                                           value=int(plan["vigencia_dias"]),
+                                           help="Solo se usa si el grupo no tiene dias")
 
-                st.markdown("**Donde entrena**")
-                d1, d2 = st.columns([1, 2])
-                sede_previa = datos_alumno.get("sede")
-                if sede_previa and not pd.isna(sede_previa):
-                    opciones = [sede_previa] + [x for x in lista_sedes if x != sede_previa]
-                else:
-                    opciones = lista_sedes
-                sede = d1.selectbox("Sede y turno", opciones)
-                dias_previos = datos_alumno.get("dias_asiste")
-                if dias_previos and not pd.isna(dias_previos):
-                    por_defecto = str(dias_previos).split()
-                else:
-                    por_defecto = ["LUN", "MIE", "VIE"]
-                dias = d2.multiselect("Dias que asiste", DIAS_SEMANA,
-                                      default=[d for d in por_defecto if d in DIAS_SEMANA])
+                # La fecha de fin es la de la ultima sesion en el calendario del grupo
+                fin = logic.fecha_fin_por_calendario(inicio, int(sesiones), dias_grupo,
+                                                     int(vigencia))
+                sede = None
 
                 st.markdown("**Cobro**")
                 e1, e2, e3 = st.columns(3)
@@ -810,9 +820,18 @@ def pagina_paquetes() -> None:
 
                 obs = st.text_input("Observacion", placeholder="Opcional")
 
-                st.info(f"**{sesiones} sesiones** con vigencia del "
-                        f"{inicio.strftime('%d/%m/%Y')} al **{fin.strftime('%d/%m/%Y')}** "
-                        f"({vigencia} dias).")
+                cronograma = logic.proximas_sesiones(inicio, int(sesiones), dias_grupo)
+                if cronograma:
+                    st.info(
+                        f"**{sesiones} sesiones** entrenando "
+                        f"{logic.frecuencia(dias_grupo)}. Primera el "
+                        f"{fecha_larga(cronograma[0])}, ultima el "
+                        f"**{fecha_larga(fin)}**."
+                    )
+                else:
+                    st.info(f"**{sesiones} sesiones** del "
+                            f"{inicio.strftime('%d/%m/%Y')} al "
+                            f"**{fin.strftime('%d/%m/%Y')}**.")
 
                 if st.form_submit_button("Registrar pedido", type="primary"):
                     medio_completo = f"{medio} {recibido}".strip() if recibido else medio
@@ -820,9 +839,10 @@ def pagina_paquetes() -> None:
                         db.crear_paquete(
                             alumno_id, plan, inicio, precio, medio_completo, pagado,
                             obs or None, fecha_pedido=fecha_pedido, sede=sede,
-                            dias_asiste=" ".join(dias),
+                            dias_asiste=dias_grupo,
                             vendedor=(vendedor or "").strip().upper() or None,
-                            tipo=tipo, sesiones=int(sesiones), vigencia_dias=int(vigencia))
+                            tipo=tipo, sesiones=int(sesiones), vigencia_dias=int(vigencia),
+                            grupo_id=grupo_id)
                         st.toast(f"Pedido {pedido} registrado", icon="\u2705")
                         st.success(f"Pedido N {pedido} registrado. "
                                    f"Vence el {fin.strftime('%d/%m/%Y')}.")

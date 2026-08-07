@@ -97,6 +97,40 @@ def actualizar_plan(plan_id: str, cambios: dict):
 
 
 # ---------------------------------------------------------------------
+# Grupos (sede + horario + genero + dias de entrenamiento)
+# ---------------------------------------------------------------------
+def listar_grupos(solo_activos: bool = True) -> pd.DataFrame:
+    try:
+        q = _tabla("grupos").select("*").order("sede")
+        if solo_activos:
+            q = q.eq("activo", True)
+        return _df(q.execute().data)
+    except Exception:
+        # Si la migracion 009 todavia no se corrio, no romper la pantalla
+        return pd.DataFrame()
+
+
+def grupo(grupo_id: str) -> dict | None:
+    r = _tabla("grupos").select("*").eq("id", grupo_id).limit(1).execute().data
+    return r[0] if r else None
+
+
+def crear_grupo(nombre, sede, genero, hora, dias):
+    return _tabla("grupos").insert({
+        "nombre": nombre.strip().upper(),
+        "sede": sede.strip().upper(),
+        "genero": genero,
+        "hora": hora,
+        "dias": dias,
+        "dias_por_semana": len(dias.split()),
+    }).execute().data
+
+
+def actualizar_grupo(grupo_id: str, cambios: dict):
+    return _tabla("grupos").update(cambios).eq("id", grupo_id).execute().data
+
+
+# ---------------------------------------------------------------------
 # Alumnos
 # ---------------------------------------------------------------------
 def crear_alumno(datos: dict):
@@ -206,7 +240,7 @@ def crear_paquete(alumno_id, plan: dict, fecha_inicio: date, precio: float,
                   fecha_pedido: date | None = None, sede: str | None = None,
                   dias_asiste: str | None = None, vendedor: str | None = None,
                   tipo: str = "NUEVO", sesiones: int | None = None,
-                  vigencia_dias: int | None = None):
+                  vigencia_dias: int | None = None, grupo_id: str | None = None):
     """Registra la venta con todos los datos del pedido.
 
     sesiones y vigencia_dias permiten ajustar el plan para una venta puntual
@@ -214,7 +248,10 @@ def crear_paquete(alumno_id, plan: dict, fecha_inicio: date, precio: float,
     """
     total = int(sesiones or plan["sesiones"])
     dias = int(vigencia_dias or plan["vigencia_dias"])
-    fecha_fin = logic.fecha_fin_plan(fecha_inicio, dias)
+    # El plan termina cuando se acaban las sesiones, contando solo los dias
+    # que entrena ese grupo. Si no hay dias, cae al metodo de dias corridos.
+    fecha_fin = logic.fecha_fin_por_calendario(fecha_inicio, total,
+                                               dias_asiste, dias)
 
     return _tabla("paquetes").insert({
         "alumno_id": alumno_id,
@@ -229,6 +266,7 @@ def crear_paquete(alumno_id, plan: dict, fecha_inicio: date, precio: float,
         "pagado": bool(pagado),
         "sede": sede,
         "dias_asiste": dias_asiste,
+        "grupo_id": grupo_id,
         "vendedor": vendedor,
         "tipo": tipo,
         "observacion": observacion,
@@ -291,8 +329,18 @@ def reactivar(congelamiento_id: str, hasta: date) -> int:
     inicio = logic.a_fecha(cong["fecha_inicio"])
     dias = logic.dias_congelamiento(inicio, hasta)
 
+    vista = paquete(cong["paquete_id"])
     pq = _tabla("paquetes").select("*").eq("id", cong["paquete_id"]).limit(1).execute().data[0]
-    nueva_fin = logic.extender(logic.a_fecha(pq["fecha_fin"]), dias)
+
+    # La nueva fecha de fin es la de su ultima sesion contando desde el alta.
+    # Sumar dias corridos podria dejarla en un dia que su grupo no entrena.
+    restantes = int(vista["sesiones_restantes"]) if vista else 0
+    dias_grupo = (vista or {}).get("dias_asiste")
+    nueva_fin = None
+    if restantes > 0 and dias_grupo:
+        nueva_fin = logic.fecha_de_sesion(hasta, restantes, dias_grupo)
+    if not nueva_fin:
+        nueva_fin = logic.extender(logic.a_fecha(pq["fecha_fin"]), dias)
 
     _tabla("paquetes").update({
         "estado": "ACTIVO",
