@@ -25,7 +25,7 @@ theme.aplicar_estilos()
 
 # Se muestra en la barra lateral. Sirve para saber de un vistazo si la version
 # que estas viendo en la nube es la misma que tienes en tu computadora.
-VERSION = "2.1"
+VERSION = "2.2"
 
 DIAS_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
 TURNOS = ["MANANA", "TARDE", "NOCHE"]
@@ -402,6 +402,27 @@ def pagina_panel() -> None:
             prom = round(len(asist_mes) / max(1, len(serie)), 1)
             st.caption(f"{len(asist_mes)} asistencias en {len(serie)} dias de entrenamiento "
                        f"(promedio {prom} por dia).")
+
+    # Quien tenia que volver de su congelamiento y todavia no lo reactivaron
+    vuelven = db.congelados_que_vuelven(hoy + timedelta(days=3))
+    if not vuelven.empty:
+        theme.seccion("Vuelven de congelamiento", "para reactivar su paquete")
+        for _, v in vuelven.iterrows():
+            prevista = logic.a_fecha(v.get("fecha_alta_prevista"))
+            faltan = (prevista - hoy).days if prevista else None
+            if faltan is None:
+                detalle, color = v.get("motivo", ""), theme.AZUL
+            elif faltan < 0:
+                detalle = f"Debia volver hace {abs(faltan)} dias"
+                color = theme.ROJO
+            elif faltan == 0:
+                detalle, color = "Vuelve hoy", theme.AMBAR
+            else:
+                detalle, color = f"Vuelve en {faltan} dias", theme.AZUL
+            theme.fila(v["alumno"], f'{v.get("codigo", "")} · {detalle}', color,
+                       theme.chip("CONGELADO"))
+        st.caption("Reactivalos en la pantalla Congelamientos para que su paquete "
+                   "vuelva a correr.")
 
     theme.seccion("Intentos rechazados",
                   "ultimos 7 dias: puerta y accesos al panel")
@@ -1005,8 +1026,9 @@ def pagina_paquetes() -> None:
 def pagina_congelamientos() -> None:
     theme.cabecera("Congelamientos", fecha_larga(logic.hoy()).upper(), "Lesiones y pausas")
     st.caption(
-        "Congelar detiene el reloj del paquete. Al dar de alta, el sistema suma "
-        "los dias perdidos a la fecha de vencimiento, asi el alumno no pierde lo que pago."
+        "Congelar detiene el reloj del paquete: mientras esta pausado no se le "
+        "descuentan sesiones. Al dar de alta, el sistema recalcula el vencimiento "
+        "contando sus sesiones restantes desde ese dia, en el calendario de su grupo."
     )
 
     tab_nuevo, tab_activos, tab_hist = st.tabs(["Congelar", "Congelados", "Historial"])
@@ -1030,14 +1052,27 @@ def pagina_congelamientos() -> None:
                 motivo = c1.selectbox("Motivo",
                                       ["LESION", "ENFERMEDAD", "VIAJE", "TRABAJO", "OTRO"])
                 desde = c2.date_input("Congelar desde", value=logic.hoy(), format="DD/MM/YYYY")
-                detalle = st.text_input("Detalle",
-                                        placeholder="Ej. esguince de tobillo, 3 semanas de reposo")
+                detalle = st.text_input(
+                    "Detalle", placeholder="Ej. esguince de tobillo, 3 semanas de reposo")
+
+                d1, d2 = st.columns([1, 2])
+                sabe_cuando = d1.checkbox("Ya se cuando vuelve", value=True)
+                alta_prevista = d2.date_input(
+                    "Fecha prevista de alta", value=logic.hoy() + timedelta(days=30),
+                    format="DD/MM/YYYY", disabled=not sabe_cuando,
+                    help="Es una estimacion. La fecha real se confirma al reactivar.")
+
                 if st.form_submit_button("Congelar paquete", type="primary"):
                     try:
-                        db.congelar(paquete_id, alumno_id, motivo, detalle, desde)
+                        db.congelar(paquete_id, alumno_id, motivo, detalle, desde,
+                                    alta_prevista if sabe_cuando else None)
                         st.toast("Paquete congelado", icon="❄️")
-                        st.success("Paquete congelado. No se le descontaran sesiones "
-                                   "hasta que lo reactives.")
+                        aviso = ("Paquete congelado. No se le descontaran "
+                                 "sesiones hasta que lo reactives.")
+                        if sabe_cuando:
+                            aviso += (" Se espera su vuelta el "
+                                      f"{fecha_larga(alta_prevista)}.")
+                        st.success(aviso)
                         st.rerun()
                     except Exception as e:
                         st.error(f"No se pudo congelar: {e}")
@@ -1050,12 +1085,29 @@ def pagina_congelamientos() -> None:
             for _, c in cong.iterrows():
                 inicio = logic.a_fecha(c["fecha_inicio"])
                 dias = logic.dias_congelamiento(inicio, logic.hoy())
+                prevista = logic.a_fecha(c.get("fecha_alta_prevista"))
                 with st.container(border=True):
                     c1, c2, c3 = st.columns([2, 1, 1])
                     c1.markdown(f"**{c['alumno']}** · {c['codigo']}")
                     c1.caption(f"{c['motivo'].title()} · {c.get('detalle') or 'sin detalle'}")
+
+                    if prevista:
+                        faltan = (prevista - logic.hoy()).days
+                        if faltan > 0:
+                            c1.caption(f"Vuelve el {fecha_larga(prevista)} "
+                                       f"(faltan {faltan} dias)")
+                        elif faltan == 0:
+                            c1.markdown(f":orange[**Vuelve hoy**, {fecha_larga(prevista)}]")
+                        else:
+                            c1.markdown(f":red[Debia volver el {fecha_larga(prevista)}, "
+                                        f"hace {abs(faltan)} dias]")
+                    else:
+                        c1.caption("Sin fecha prevista de alta")
+
                     c2.metric("Congelado desde", inicio.strftime("%d/%m/%Y"), f"{dias} dias")
-                    alta = c3.date_input("Fecha de alta", value=logic.hoy(),
+                    # Se propone la fecha que se habia estimado al congelar
+                    por_defecto = prevista if prevista and prevista >= inicio else logic.hoy()
+                    alta = c3.date_input("Fecha de alta", value=por_defecto,
                                          min_value=inicio, format="DD/MM/YYYY",
                                          key=f"alta_{c['id']}")
                     if c3.button("Reactivar", key=f"react_{c['id']}",
@@ -1074,10 +1126,14 @@ def pagina_congelamientos() -> None:
         if hist.empty:
             st.caption("Sin registros.")
         else:
-            vista = hist[["codigo", "alumno", "motivo", "detalle", "fecha_inicio",
-                          "fecha_fin", "dias_aplicados", "activo"]].copy()
+            columnas = ["codigo", "alumno", "motivo", "detalle", "fecha_inicio",
+                        "fecha_alta_prevista", "fecha_fin", "dias_aplicados", "activo"]
+            for col in columnas:
+                if col not in hist.columns:
+                    hist[col] = None
+            vista = hist[columnas].copy()
             vista.columns = ["Codigo", "Alumno", "Motivo", "Detalle", "Desde",
-                             "Hasta", "Dias devueltos", "Vigente"]
+                             "Alta prevista", "Alta real", "Dias devueltos", "Vigente"]
             st.dataframe(vista, width="stretch", hide_index=True)
 
 

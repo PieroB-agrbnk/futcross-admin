@@ -323,14 +323,20 @@ def cancelar_paquete(paquete_id: str, motivo: str):
 # ---------------------------------------------------------------------
 # Congelamientos
 # ---------------------------------------------------------------------
-def congelar(paquete_id: str, alumno_id: str, motivo: str, detalle: str, desde: date):
-    """Pausa el paquete. La vigencia se extiende recien al reactivar."""
+def congelar(paquete_id: str, alumno_id: str, motivo: str, detalle: str,
+             desde: date, alta_prevista: date | None = None):
+    """Pausa el paquete.
+
+    alta_prevista es cuando se espera que vuelva. Es solo una estimacion:
+    la fecha real se confirma al reactivar, y es esa la que manda.
+    """
     _tabla("congelamientos").insert({
         "paquete_id": paquete_id,
         "alumno_id": alumno_id,
         "motivo": motivo,
         "detalle": detalle,
         "fecha_inicio": desde.isoformat(),
+        "fecha_alta_prevista": alta_prevista.isoformat() if alta_prevista else None,
     }).execute()
     _tabla("paquetes").update({"estado": "CONGELADO"}).eq("id", paquete_id).execute()
 
@@ -378,6 +384,24 @@ def congelamientos(activos: bool | None = True) -> pd.DataFrame:
     if activos is not None:
         q = q.eq("activo", activos)
     rows = q.order("fecha_inicio", desc=True).execute().data or []
+    for r in rows:
+        a = r.pop("alumnos", None) or {}
+        r["codigo"] = a.get("codigo")
+        r["alumno"] = f"{a.get('nombres','')} {a.get('apellidos','')}".strip()
+        r["telefono"] = a.get("telefono")
+    return _df(rows)
+
+
+def congelados_que_vuelven(hasta: date) -> pd.DataFrame:
+    """Congelamientos cuya fecha prevista de alta ya llego o esta por llegar."""
+    try:
+        rows = (_tabla("congelamientos")
+                .select("*, alumnos(codigo,nombres,apellidos,telefono)")
+                .eq("activo", True)
+                .lte("fecha_alta_prevista", hasta.isoformat())
+                .order("fecha_alta_prevista").execute().data) or []
+    except Exception:
+        return pd.DataFrame()
     for r in rows:
         a = r.pop("alumnos", None) or {}
         r["codigo"] = a.get("codigo")
