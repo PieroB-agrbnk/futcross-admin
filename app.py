@@ -25,7 +25,7 @@ theme.aplicar_estilos()
 
 # Se muestra en la barra lateral. Sirve para saber de un vistazo si la version
 # que estas viendo en la nube es la misma que tienes en tu computadora.
-VERSION = "2.2"
+VERSION = "2.3"
 
 DIAS_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
 TURNOS = ["MANANA", "TARDE", "NOCHE"]
@@ -1058,8 +1058,8 @@ def pagina_congelamientos() -> None:
                 d1, d2 = st.columns([1, 2])
                 sabe_cuando = d1.checkbox("Ya se cuando vuelve", value=True)
                 alta_prevista = d2.date_input(
-                    "Fecha prevista de alta", value=logic.hoy() + timedelta(days=30),
-                    format="DD/MM/YYYY", disabled=not sabe_cuando,
+                    "Fecha prevista de alta", value=desde + timedelta(days=30),
+                    min_value=desde, format="DD/MM/YYYY", disabled=not sabe_cuando,
                     help="Es una estimacion. La fecha real se confirma al reactivar.")
 
                 if st.form_submit_button("Congelar paquete", type="primary"):
@@ -1084,7 +1084,10 @@ def pagina_congelamientos() -> None:
         else:
             for _, c in cong.iterrows():
                 inicio = logic.a_fecha(c["fecha_inicio"])
-                dias = logic.dias_congelamiento(inicio, logic.hoy())
+                # El congelamiento puede estar programado a futuro: en ese caso
+                # todavia no lleva dias, y contarlos daria un numero negativo.
+                aun_no_empieza = inicio > logic.hoy()
+                dias = 0 if aun_no_empieza else logic.dias_congelamiento(inicio, logic.hoy())
                 prevista = logic.a_fecha(c.get("fecha_alta_prevista"))
                 with st.container(border=True):
                     c1, c2, c3 = st.columns([2, 1, 1])
@@ -1104,9 +1107,16 @@ def pagina_congelamientos() -> None:
                     else:
                         c1.caption("Sin fecha prevista de alta")
 
-                    c2.metric("Congelado desde", inicio.strftime("%d/%m/%Y"), f"{dias} dias")
+                    if aun_no_empieza:
+                        faltan_ini = (inicio - logic.hoy()).days
+                        c2.metric("Se congela el", inicio.strftime("%d/%m/%Y"),
+                                  f"en {faltan_ini} dias", delta_color="off")
+                    else:
+                        c2.metric("Congelado desde", inicio.strftime("%d/%m/%Y"),
+                                  f"{dias} dias")
                     # Se propone la fecha que se habia estimado al congelar
-                    por_defecto = prevista if prevista and prevista >= inicio else logic.hoy()
+                    por_defecto = prevista if prevista and prevista >= inicio \
+                        else max(inicio, logic.hoy())
                     alta = c3.date_input("Fecha de alta", value=por_defecto,
                                          min_value=inicio, format="DD/MM/YYYY",
                                          key=f"alta_{c['id']}")
