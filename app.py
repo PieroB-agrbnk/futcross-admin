@@ -25,7 +25,7 @@ theme.aplicar_estilos()
 
 # Se muestra en la barra lateral. Sirve para saber de un vistazo si la version
 # que estas viendo en la nube es la misma que tienes en tu computadora.
-VERSION = "2.4"
+VERSION = "2.5"
 
 DIAS_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
 TURNOS = ["MANANA", "TARDE", "NOCHE"]
@@ -36,9 +36,16 @@ MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio",
 DIAS = ["lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo"]
 
 
-def selector_de_grupo(etiqueta="Grupo", clave=None, grupo_actual=None):
-    """Devuelve (grupo_id, dias, texto). Los grupos son sede + horario + genero,
-    y de ahi salen los dias de entrenamiento que definen el vencimiento."""
+def selector_de_grupo(etiqueta="Grupo", clave=None, grupo_actual=None,
+                      dias_previos=None, dias_del_plan=None):
+    """Elige el grupo y, dentro de el, que dias asiste el alumno.
+
+    El grupo dice que dias hay disponibles (Surquillo abre lun, mie y vie).
+    El plan dice cuantos usa por semana (el basico, dos). Cual de esos dias
+    va cada alumno es decision suya, asi que se pregunta.
+
+    Devuelve (grupo_id, dias_elegidos, texto).
+    """
     grupos = db.listar_grupos()
     if grupos.empty:
         st.warning("No hay grupos cargados. Corre migracion-009.sql en Supabase.")
@@ -55,9 +62,37 @@ def selector_de_grupo(etiqueta="Grupo", clave=None, grupo_actual=None):
             if opciones[k]["id"] == grupo_actual:
                 indice = i
                 break
-    elegido = st.selectbox(etiqueta, llaves, index=indice, key=clave)
+
+    c1, c2 = st.columns([1.4, 1.6])
+    elegido = c1.selectbox(etiqueta, llaves, index=indice, key=clave)
     g = opciones[elegido]
-    return g["id"], g["dias"], f"{g['sede']} {g['hora']} - {logic.frecuencia(g['dias'])}"
+    disponibles = [d for d in str(g["dias"]).split() if d in DIAS_SEMANA]
+
+    # Que dias viene: por defecto los que ya tenia, o los primeros que
+    # alcancen para la frecuencia del plan.
+    previos = [d for d in (dias_previos or "").split() if d in disponibles]
+    if not previos:
+        previos = disponibles[:dias_del_plan] if dias_del_plan else disponibles
+
+    elegidos = c2.multiselect(
+        "Dias que asiste", disponibles, default=previos,
+        key=f"{clave}_dias" if clave else None,
+        help=f"El grupo entrena {' '.join(disponibles)}. "
+             "Marca solo los dias que viene este alumno.")
+
+    if dias_del_plan and elegidos and len(elegidos) != dias_del_plan:
+        c2.warning(f"Este plan es de {dias_del_plan} "
+                   f"{'dia' if dias_del_plan == 1 else 'dias'} por semana y "
+                   f"marcaste {len(elegidos)}. El vencimiento se calcula con "
+                   "los dias marcados.")
+
+    # Se ordenan como la semana, no como se hizo clic
+    orden = {d: i for i, d in enumerate(DIAS_SEMANA)}
+    dias = " ".join(sorted(elegidos, key=lambda d: orden[d]))
+    texto = f"{g['sede']} {g['hora']}"
+    if dias:
+        texto += f" - {logic.frecuencia(dias)}"
+    return g["id"], dias, texto
 
 
 def fecha_larga(d) -> str:
@@ -544,18 +579,13 @@ def pagina_alumnos() -> None:
                                         placeholder="se toma la de hoy")
             inscripcion = logic.hoy()
 
-            st.markdown("**Grupo al que entra**")
-            grupo_id, dias_grupo, detalle = selector_de_grupo(
-                "Sede, horario y genero", clave="grupo_nuevo_alumno")
-            if detalle:
-                st.caption(detalle)
-            sede = dias = horario = turno = None
-
             emergencia = c2.text_input("Contacto de emergencia")
             notas = st.text_area("Notas", placeholder="Lesiones previas, observaciones, etc.")
 
             # Un alumno nuevo casi siempre entra comprando. Se hace en el mismo
             # paso para no obligar a ir despues a la pantalla de Paquetes.
+            # El plan va antes del grupo porque de el sale cuantos dias por
+            # semana entrena, y eso define que dias se pueden marcar.
             st.markdown("**Plan que contrata**")
             planes_disp = db.listar_planes()
             vender_ahora = st.checkbox("Registrar su primer pedido ahora",
@@ -566,6 +596,7 @@ def pagina_alumnos() -> None:
 
             plan_elegido = None
             inicio_plan = precio_plan = medio_plan = vendedor_plan = None
+            frecuencia_plan = None
             if not planes_disp.empty:
                 q1, q2 = st.columns([2, 1])
                 nombre_plan = q1.selectbox("Plan", planes_disp["nombre"].tolist())
@@ -573,16 +604,30 @@ def pagina_alumnos() -> None:
                     planes_disp["nombre"] == nombre_plan].iloc[0].to_dict()
                 inicio_plan = q2.date_input("Inicio del plan", value=logic.hoy(),
                                             format="DD/MM/YYYY")
+                frecuencia_plan = plan_elegido.get("dias_por_semana")
+                if frecuencia_plan is not None and pd.isna(frecuencia_plan):
+                    frecuencia_plan = None
 
+            st.markdown("**Grupo y dias que entrena**")
+            grupo_id, dias_grupo, detalle = selector_de_grupo(
+                "Sede, horario y genero", clave="grupo_nuevo_alumno",
+                dias_del_plan=int(frecuencia_plan) if frecuencia_plan else None)
+            if detalle:
+                st.caption(detalle)
+            sede = dias = horario = turno = None
+
+            if plan_elegido is not None:
                 fin_plan = logic.fecha_fin_por_calendario(
                     inicio_plan, int(plan_elegido["sesiones"]), dias_grupo,
                     int(plan_elegido["vigencia_dias"]))
                 if dias_grupo:
-                    st.caption(
-                        f"{plan_elegido['sesiones']} sesiones entrenando "
-                        f"{logic.frecuencia(dias_grupo)}. Ultima sesion el "
-                        f"{fecha_larga(fin_plan)}."
+                    st.info(
+                        f"**{plan_elegido['sesiones']} sesiones** entrenando "
+                        f"{logic.frecuencia(dias_grupo)} ({dias_grupo}). "
+                        f"Ultima sesion el **{fecha_larga(fin_plan)}**."
                     )
+
+            if plan_elegido is not None:
 
                 r1, r2, r3 = st.columns(3)
                 precio_plan = r1.number_input("Monto cobrado (S/)", min_value=0.0,
@@ -690,10 +735,11 @@ def editar_alumno() -> None:
                                    min_value=logic.hoy() - timedelta(days=365 * 80),
                                    max_value=logic.hoy(), format="DD/MM/YYYY")
 
-        st.markdown("**Grupo**")
+        st.markdown("**Grupo y dias que entrena**")
         grupo_id, dias_grupo, detalle = selector_de_grupo(
             "Sede, horario y genero", clave="grupo_editar",
-            grupo_actual=a.get("grupo_id"))
+            grupo_actual=a.get("grupo_id"),
+            dias_previos=texto("dias_asiste"))
         if detalle:
             st.caption(detalle)
         sede = turno = horario = None
@@ -764,7 +810,15 @@ def ficha_alumno(alumno_id: str) -> None:
         paquetes["estado_real"].isin(["ACTIVO", "CONGELADO"])]
     if vigente is not None and not vigente.empty:
         p = vigente.iloc[0]
-        c2.metric("Sesiones restantes", f"{p['sesiones_restantes']} de {p['sesiones_totales']}")
+        # Si tiene varios paquetes encolados, lo que importa es el total
+        por_consumir = paquetes[paquetes["estado_real"].isin(["ACTIVO", "CONGELADO"])]
+        total_pend = int(por_consumir["sesiones_restantes"].sum())
+        if len(por_consumir) > 1:
+            c2.metric("Sesiones restantes", total_pend,
+                      f"en {len(por_consumir)} paquetes")
+        else:
+            c2.metric("Sesiones restantes",
+                      f"{p['sesiones_restantes']} de {p['sesiones_totales']}")
         c3.metric("Vence", logic.a_fecha(p["fecha_fin"]).strftime("%d/%m/%Y"),
                   f"{p['dias_restantes']} dias")
         with c1:
@@ -872,9 +926,10 @@ def pagina_paquetes() -> None:
             if vigente:
                 st.warning(
                     f"Este alumno ya tiene un paquete {vigente['estado_real'].lower()}: "
-                    f"{vigente['plan_nombre']}, le quedan {vigente['sesiones_restantes']} sesiones "
-                    f"y vence el {logic.a_fecha(vigente['fecha_fin']).strftime('%d/%m/%Y')}. "
-                    "Si vendes uno nuevo, el sistema consumira primero el que vence antes."
+                    f"{vigente['plan_nombre']}, le quedan "
+                    f"{vigente['sesiones_restantes']} sesiones y su ultima cae el "
+                    f"{logic.a_fecha(vigente['fecha_fin']).strftime('%d/%m/%Y')}. "
+                    "El nuevo se puede encolar para que arranque cuando termine ese."
                 )
 
             # Lo que ya sabemos del alumno se hereda, para no volver a escribirlo
@@ -895,17 +950,36 @@ def pagina_paquetes() -> None:
                 fecha_pedido = c2.date_input("Fecha del pedido", value=logic.hoy(),
                                              format="DD/MM/YYYY",
                                              help="Cuando se cerro la venta")
-                inicio = c3.date_input("Inicio del plan", value=logic.hoy(),
-                                       format="DD/MM/YYYY",
-                                       help="Puede ser posterior a la fecha del pedido")
 
-                st.markdown("**Grupo**")
+                # Si ya tiene un paquete corriendo, lo natural es que el nuevo
+                # arranque al dia siguiente de la ultima sesion del actual.
+                # Asi las sesiones se suman en vez de correr en paralelo.
+                if vigente is not None:
+                    sugerido = logic.a_fecha(vigente["fecha_fin"]) + timedelta(days=1)
+                    sugerido = max(sugerido, logic.hoy())
+                else:
+                    sugerido = logic.hoy()
+
+                inicio = c3.date_input(
+                    "Inicio del plan", value=sugerido, format="DD/MM/YYYY",
+                    help="Si ya tiene un paquete, se propone el dia siguiente al "
+                         "que termina, para que las sesiones se sumen")
+
+                st.markdown("**Grupo y dias que entrena**")
                 grupo_previo = datos_alumno.get("grupo_id")
                 if grupo_previo is not None and pd.isna(grupo_previo):
                     grupo_previo = None
+                dias_previos = datos_alumno.get("dias_asiste")
+                if dias_previos is None or (isinstance(dias_previos, float)
+                                            and pd.isna(dias_previos)):
+                    dias_previos = ""
+                frec = plan.get("dias_por_semana")
+                if frec is not None and pd.isna(frec):
+                    frec = None
                 grupo_id, dias_grupo, detalle = selector_de_grupo(
                     "Sede, horario y genero", clave="grupo_venta",
-                    grupo_actual=grupo_previo)
+                    grupo_actual=grupo_previo, dias_previos=str(dias_previos),
+                    dias_del_plan=int(frec) if frec else None)
                 if detalle:
                     st.caption(detalle)
 
@@ -944,6 +1018,24 @@ def pagina_paquetes() -> None:
                 pagado = f3.selectbox("Estado del pago", ["Pagado", "Pendiente"]) == "Pagado"
 
                 obs = st.text_input("Observacion", placeholder="Opcional")
+
+                if vigente is not None:
+                    fin_actual = logic.a_fecha(vigente["fecha_fin"])
+                    restantes_actual = int(vigente["sesiones_restantes"])
+                    if inicio > fin_actual:
+                        st.success(
+                            f"Se encola: primero termina sus {restantes_actual} "
+                            f"sesiones pendientes (hasta el {fecha_larga(fin_actual)}) "
+                            f"y despues corren las {sesiones} nuevas. En total le "
+                            f"quedaran **{restantes_actual + int(sesiones)} sesiones**."
+                        )
+                    else:
+                        st.warning(
+                            f"Los dos paquetes van a estar vigentes a la vez. El "
+                            f"kiosco descuenta primero el que termina antes "
+                            f"({fecha_larga(fin_actual)}). Si querias que se sumen "
+                            f"uno detras del otro, pon el inicio despues de esa fecha."
+                        )
 
                 cronograma = logic.proximas_sesiones(inicio, int(sesiones), dias_grupo)
                 if cronograma:
