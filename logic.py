@@ -83,6 +83,9 @@ def estado_real(paquete: dict, ref: date | None = None) -> str:
         return "CANCELADO"
     if paquete.get("estado") == "CONGELADO":
         return "CONGELADO"
+    inicio = a_fecha(paquete.get("fecha_inicio"))
+    if inicio and ref < inicio:
+        return "POR EMPEZAR"
     usadas = int(paquete.get("sesiones_usadas") or 0)
     totales = int(paquete.get("sesiones_totales") or 0)
     if usadas >= totales:
@@ -117,21 +120,34 @@ def puede_entrenar(paquete: dict | None, ya_marco_hoy: bool = False,
         return False, "SIN_PAQUETE", "No tiene un paquete registrado. Pasa por caja para inscribirte."
 
     estado = estado_real(paquete, ref)
+    ref = ref or hoy()
 
     if estado == "CANCELADO":
         return False, "CANCELADO", "Este paquete fue anulado. Consulta en recepcion."
     if estado == "CONGELADO":
-        return False, "CONGELADO", "Tu paquete esta congelado. Avisa en recepcion para reactivarlo."
+        return False, "CONGELADO", "Tu plan esta en pausa. Avisa en recepcion para reactivarlo."
+    if estado == "POR EMPEZAR":
+        inicio = a_fecha(paquete.get("fecha_inicio"))
+        return False, "POR_EMPEZAR", (
+            f"Tu plan arranca el {inicio.strftime('%d/%m/%Y')}. Nos vemos ese dia.")
     if estado == "AGOTADO":
         total = paquete.get("sesiones_totales")
-        return False, "AGOTADO", f"Ya usaste tus {total} sesiones. Toca renovar el paquete."
+        return False, "AGOTADO", f"Ya se cumplieron tus {total} sesiones. Toca renovar."
     if estado == "VENCIDO":
         fin = a_fecha(paquete.get("fecha_fin"))
-        return False, "VENCIDO", f"Tu paquete vencio el {fin.strftime('%d/%m/%Y')}. Toca renovar."
+        return False, "VENCIDO", f"Tu plan termino el {fin.strftime('%d/%m/%Y')}. Toca renovar."
+
+    # Hoy no toca entrenar a su grupo: no se le impide pasar, pero se le
+    # avisa, porque su plan corre por los dias que eligio.
+    dias = paquete.get("dias_asiste")
+    if dias and not es_dia_de_entrenamiento(ref, dias):
+        return True, "OTRO_DIA", (
+            "Hoy no es uno de tus dias. Igual quedas registrado, pero tu plan "
+            "corre por los dias que elegiste.")
     if ya_marco_hoy:
         return False, "YA_MARCO", "Ya registraste tu asistencia de hoy."
 
-    return True, "OK", "Asistencia registrada. A entrenar."
+    return True, "OK", "Estas al dia. A entrenar."
 
 
 # ---------------------------------------------------------------------

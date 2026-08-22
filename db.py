@@ -543,7 +543,12 @@ def congelar(paquete_id: str, alumno_id: str, motivo: str, detalle: str,
         "fecha_inicio": desde.isoformat(),
         "fecha_alta_prevista": alta_prevista.isoformat() if alta_prevista else None,
     }).execute()
-    _tabla("paquetes").update({"estado": "CONGELADO"}).eq("id", paquete_id).execute()
+
+    # Un viaje que empieza en dos semanas no puede pausar el plan hoy: la
+    # persona todavia entrena. La pausa se activa sola al llegar la fecha
+    # (fc_activar_congelamientos, que corre de noche y al abrir el panel).
+    if desde <= logic.hoy():
+        _tabla("paquetes").update({"estado": "CONGELADO"}).eq("id", paquete_id).execute()
     invalidar_cache()
 
 
@@ -600,6 +605,18 @@ def congelamientos(activos: bool | None = True) -> pd.DataFrame:
     return _df(rows)
 
 
+def activar_congelamientos() -> int:
+    """Pone en pausa los congelamientos programados cuya fecha ya llego."""
+    try:
+        r = cliente().rpc("fc_activar_congelamientos", {}).execute()
+        n = int(r.data or 0)
+    except Exception:
+        return 0
+    if n:
+        invalidar_cache()
+    return n
+
+
 def reactivar_automaticos() -> int:
     """Da de alta los congelamientos cuya fecha prevista ya llego.
 
@@ -644,6 +661,42 @@ def congelamiento_abierto(paquete_id: str) -> dict | None:
     r = (_tabla("congelamientos").select("*")
          .eq("paquete_id", paquete_id).eq("activo", True).limit(1).execute().data)
     return r[0] if r else None
+
+
+# ---------------------------------------------------------------------
+# Dias que la academia no abrio
+#
+# Esas sesiones no se le cuentan a nadie: el plan se corre solo, porque
+# `sesiones_usadas` sale del calendario y estos dias se descuentan ahi.
+# ---------------------------------------------------------------------
+@_cache(CACHE_CORTO)
+def dias_no_laborables(desde: date | None = None) -> pd.DataFrame:
+    try:
+        q = _tabla("dias_no_laborables").select("*, grupos(nombre)")
+        if desde:
+            q = q.gte("fecha", desde.isoformat())
+        rows = q.order("fecha", desc=True).execute().data or []
+    except Exception:
+        return pd.DataFrame()
+    for r in rows:
+        g = r.pop("grupos", None) or {}
+        r["grupo"] = g.get("nombre") or "Todos los grupos"
+    return _df(rows)
+
+
+def marcar_no_laborable(fecha: date, grupo_id: str | None, motivo: str):
+    r = _tabla("dias_no_laborables").insert({
+        "fecha": fecha.isoformat(),
+        "grupo_id": grupo_id,
+        "motivo": motivo,
+    }).execute().data
+    invalidar_cache()
+    return r
+
+
+def quitar_no_laborable(registro_id: str):
+    _tabla("dias_no_laborables").delete().eq("id", registro_id).execute()
+    invalidar_cache()
 
 
 # ---------------------------------------------------------------------

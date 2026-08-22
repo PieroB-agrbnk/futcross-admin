@@ -26,7 +26,7 @@ theme.aplicar_estilos()
 
 # Se muestra en la barra lateral. Sirve para saber de un vistazo si la version
 # que estas viendo en la nube es la misma que tienes en tu computadora.
-VERSION = "2.9"
+VERSION = "3.0"
 
 DIAS_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
 TURNOS = ["MANANA", "TARDE", "NOCHE"]
@@ -152,7 +152,8 @@ def con_alertas(alumnos: pd.DataFrame) -> pd.DataFrame:
 # poder cambiar precios: eso es plata y es del administrador.
 PERMISOS = {
     "admin": ["Panel", "Marcar asistencia", "Renovaciones", "Alumnos",
-              "Paquetes", "Congelamientos", "Reportes", "Planes", "Accesos"],
+              "Paquetes", "Congelamientos", "Reportes", "Planes",
+              "Dias sin entrenar", "Accesos"],
     "entrenador": ["Panel", "Marcar asistencia", "Alumnos", "Renovaciones"],
 }
 
@@ -346,6 +347,8 @@ def procesar_marca(fila: dict) -> None:
     marco = db.ya_marco_hoy(alumno_id)
     autorizado, motivo, mensaje = logic.puede_entrenar(pq, ya_marco_hoy=marco)
 
+    # El plan corre por calendario: marcar NO descuenta nada, solo deja
+    # constancia de quien vino. Estas dos cifras salen de la vista.
     usadas = int(pq["sesiones_usadas"]) if pq else None
     totales = int(pq["sesiones_totales"]) if pq else None
     vence = None
@@ -355,7 +358,6 @@ def procesar_marca(fila: dict) -> None:
     if autorizado:
         try:
             db.marcar_asistencia(alumno_id, pq["id"], sede=fila.get("sede"), origen="KIOSCO")
-            usadas += 1
         except Exception as e:
             if "uq_asistencia_dia" in str(e) or "duplicate" in str(e).lower():
                 autorizado, motivo = False, "YA_MARCO"
@@ -368,12 +370,14 @@ def procesar_marca(fila: dict) -> None:
 
     veredicto = {
         "OK": "Pasa a la cancha",
+        "OTRO_DIA": "Pasa, pero ojo",
         "YA_MARCO": "Ya marcaste hoy",
-        "VENCIDO": "Paquete vencido",
-        "AGOTADO": "Sesiones agotadas",
-        "CONGELADO": "Paquete congelado",
-        "CANCELADO": "Paquete anulado",
-        "SIN_PAQUETE": "Sin paquete",
+        "VENCIDO": "Plan terminado",
+        "AGOTADO": "Plan terminado",
+        "CONGELADO": "Plan en pausa",
+        "POR_EMPEZAR": "Todavia no arranca",
+        "CANCELADO": "Plan anulado",
+        "SIN_PAQUETE": "Sin plan",
     }.get(motivo, "Revisar en recepcion")
 
     st.session_state["kiosco"] = {
@@ -429,8 +433,9 @@ def pagina_checkin() -> None:
                 st.rerun()
 
         st.caption(
-            "Cada alumno marca una sola vez por dia. "
-            "Si tu paquete esta vencido o congelado, el sistema no lo descuenta."
+            "El plan corre por calendario: las sesiones se cuentan desde el dia "
+            "que arranca, vaya o no vaya el alumno. Marcar aca no descuenta "
+            "nada, solo deja registro de quien vino."
         )
 
     with der:
@@ -1854,7 +1859,72 @@ def pagina_planes() -> None:
 
 
 # =====================================================================
-# 9. ACCESOS
+# 9. DIAS SIN ENTRENAMIENTO
+# =====================================================================
+def pagina_dias_libres() -> None:
+    theme.cabecera("Dias sin entrenamiento", fecha_larga(logic.hoy()).upper(),
+                   "Feriados y cancelaciones")
+    st.caption(
+        "Como el plan corre por calendario, un dia que la academia no abre le "
+        "consumiria una sesion a todos igual. Al marcarlo aca, ese dia deja de "
+        "contar y a cada alumno se le corre el plan una sesion mas."
+    )
+
+    grupos = db.listar_grupos()
+
+    with st.form("form_no_laborable"):
+        c1, c2 = st.columns([1, 2])
+        fecha = c1.date_input("Dia que no se entreno", value=logic.hoy(),
+                              format="DD/MM/YYYY")
+
+        opciones = {"Todos los grupos": None}
+        if not grupos.empty:
+            for _, g in grupos.iterrows():
+                opciones[f"{g['nombre']} ({g['dias']})"] = g["id"]
+        cual = c2.selectbox("A que grupo afecta", list(opciones.keys()),
+                            help="Un feriado afecta a todos; una cancha ocupada, "
+                                 "solo a ese grupo")
+
+        motivo = st.text_input("Motivo", placeholder="Ej. Feriado 28 de julio, "
+                                                     "lluvia, cancha ocupada")
+
+        if st.form_submit_button("Marcar el dia", type="primary"):
+            try:
+                db.marcar_no_laborable(fecha, opciones[cual], motivo or None)
+                st.toast("Dia marcado", icon="\u2705")
+                st.success(
+                    f"El {fecha_larga(fecha)} ya no le cuenta a "
+                    f"{cual.lower()}. Sus planes se corren una sesion."
+                )
+                st.rerun()
+            except Exception as e:
+                if "uq_no_laborable" in str(e) or "duplicate" in str(e).lower():
+                    st.warning("Ese dia ya estaba marcado para ese grupo.")
+                else:
+                    st.error(f"No se pudo marcar: {e}")
+
+    theme.seccion("Dias marcados", "de los ultimos meses")
+    dias = db.dias_no_laborables(logic.hoy() - timedelta(days=180))
+    if dias.empty:
+        theme.vacio("Ningun dia marcado",
+                    "Cuando no entrenen por feriado o lluvia, marcalo aca para "
+                    "que nadie pierda su sesion.")
+    else:
+        for _, d in dias.iterrows():
+            f = logic.a_fecha(d["fecha"])
+            c1, c2 = st.columns([5, 1])
+            with c1:
+                theme.fila(fecha_larga(f).title(),
+                           f'{d.get("grupo", "")} · {d.get("motivo") or "sin motivo"}',
+                           theme.AZUL)
+            if c2.button("Quitar", key=f"quitar_{d['id']}", width="stretch"):
+                db.quitar_no_laborable(d["id"])
+                st.toast("Dia desmarcado", icon="\u2705")
+                st.rerun()
+
+
+# =====================================================================
+# 10. ACCESOS
 # =====================================================================
 def pagina_accesos() -> None:
     theme.cabecera("Accesos", fecha_larga(logic.hoy()).upper(), "Claves del equipo")
@@ -1942,13 +2012,14 @@ PAGINAS_ADMIN = {
     "Congelamientos": pagina_congelamientos,
     "Reportes": pagina_reportes,
     "Planes": pagina_planes,
+    "Dias sin entrenar": pagina_dias_libres,
     "Accesos": pagina_accesos,
 }
 
 GRUPOS = [
     ("Dia a dia", ["Panel", "Marcar asistencia", "Renovaciones"]),
     ("Alumnos y pagos", ["Alumnos", "Paquetes", "Congelamientos"]),
-    ("Gestion", ["Reportes", "Planes", "Accesos"]),
+    ("Gestion", ["Reportes", "Planes", "Dias sin entrenar", "Accesos"]),
 ]
 
 
@@ -2048,6 +2119,14 @@ def main() -> None:
             n = db.reactivar_automaticos()
             if n:
                 st.toast(f"{n} alumno(s) reactivados automaticamente", icon="\u2705")
+        except Exception:
+            pass
+        # Y las pausas programadas cuya fecha ya llego (viajes avisados
+        # con anticipacion)
+        try:
+            c = db.activar_congelamientos()
+            if c:
+                st.toast(f"{c} plan(es) entraron en pausa programada", icon="\u2744\ufe0f")
         except Exception:
             pass
 
