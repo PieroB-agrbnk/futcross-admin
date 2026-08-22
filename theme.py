@@ -20,10 +20,24 @@ Tipografia
 """
 
 import base64
+import html
 from functools import lru_cache
 from pathlib import Path
 
 import streamlit as st
+
+
+def esc(valor) -> str:
+    """Escapa texto que viene de la base antes de meterlo en el HTML.
+
+    Todas estas tarjetas se pintan con `unsafe_allow_html=True`. Un
+    alumno cargado como "Juan <b>" o una observacion con un `<` rompian
+    el diseno de la pantalla, y con un poco de mala fe se podia inyectar
+    marcado. Los nombres pasan por aca.
+    """
+    if valor is None:
+        return ""
+    return html.escape(str(valor), quote=True)
 
 NARANJA = "#F07412"   # naranja exacto del logo de FutCross
 BRASA = "#FF9440"
@@ -438,13 +452,14 @@ def kpis(items: list[tuple]) -> None:
 
 def chip(texto: str) -> str:
     color = COLOR_ESTADO.get(texto, "#6B7280")
-    return f'<span class="chip" style="background:{color}">{texto}</span>'
+    return f'<span class="chip" style="background:{color}">{esc(texto)}</span>'
 
 
 def fila(nombre: str, detalle: str, color: str, derecha: str = "") -> None:
     st.markdown(
         f'<div class="fila" style="border-left-color:{color}">'
-        f'<div><div class="nom">{nombre}</div><div class="mot">{detalle}</div></div>'
+        f'<div><div class="nom">{esc(nombre)}</div>'
+        f'<div class="mot">{esc(detalle)}</div></div>'
         f'<div class="der">{derecha}</div></div>',
         unsafe_allow_html=True,
     )
@@ -452,7 +467,7 @@ def fila(nombre: str, detalle: str, color: str, derecha: str = "") -> None:
 
 def vacio(titulo: str, mensaje: str) -> None:
     st.markdown(
-        f'<div class="vacio"><h3>{titulo}</h3><p>{mensaje}</p></div>',
+        f'<div class="vacio"><h3>{esc(titulo)}</h3><p>{esc(mensaje)}</p></div>',
         unsafe_allow_html=True,
     )
 
@@ -483,15 +498,16 @@ def tarjeta_resultado(nombre: str, codigo: str, veredicto: str, mensaje: str,
     clase = "ok" if autorizado else "no"
     partes = [
         f'<div class="resultado {clase}">',
-        f'<div class="cod">{codigo}</div>',
-        f'<h2>{nombre}</h2>',
-        f'<div class="vered {clase}">{veredicto}</div>',
-        f'<div class="det">{mensaje}</div>',
+        f'<div class="cod">{esc(codigo)}</div>',
+        f'<h2>{esc(nombre)}</h2>',
+        f'<div class="vered {clase}">{esc(veredicto)}</div>',
+        f'<div class="det">{esc(mensaje)}</div>',
     ]
     if usadas is not None and totales:
         partes.append(marcador_html(usadas, totales, marcar_hoy=autorizado))
     if vence:
-        partes.append(f'<div class="cod" style="margin-top:.9rem">Vence el {vence}</div>')
+        partes.append(f'<div class="cod" style="margin-top:.9rem">'
+                      f'Vence el {esc(vence)}</div>')
     partes.append("</div>")
     return "".join(partes)
 
@@ -537,7 +553,7 @@ def avatar(nombre: str, grande: bool = False) -> str:
     tiene siempre el mismo y se reconoce de un vistazo."""
     color = _PALETA_AVATAR[sum(ord(c) for c in (nombre or "?")) % len(_PALETA_AVATAR)]
     clase = "avatar grande" if grande else "avatar"
-    return f'<div class="{clase}" style="background:{color}">{iniciales(nombre)}</div>'
+    return f'<div class="{clase}" style="background:{color}">{esc(iniciales(nombre))}</div>'
 
 
 def barra(usadas: int, totales: int) -> str:
@@ -593,26 +609,28 @@ def mapa_calor(conteos: dict, hoy, semanas: int = 9) -> str:
 
 
 def ficha_alumno(nombre: str, codigo: str, detalle: str, derecha: str = "") -> str:
+    """`detalle` y `derecha` llegan ya como HTML armado por la pantalla;
+    lo que viene de la base (nombre y codigo) se escapa aca."""
     return (
         f'<div class="ficha">{avatar(nombre, grande=True)}'
-        f'<div><div class="nom">{nombre}</div>'
-        f'<div class="sub">{codigo} &middot; {detalle}</div></div>'
+        f'<div><div class="nom">{esc(nombre)}</div>'
+        f'<div class="sub">{esc(codigo)} &middot; {detalle}</div></div>'
         f'<div style="margin-left:auto;text-align:right">{derecha}</div></div>'
     )
 
 
 def pastilla(nombre: str, hora: str = "") -> str:
     return (
-        f'<span class="pastilla">{avatar(nombre)}{nombre}'
-        f'<span class="hora">{hora}</span></span>'
+        f'<span class="pastilla">{avatar(nombre)}{esc(nombre)}'
+        f'<span class="hora">{esc(hora)}</span></span>'
     )
 
 
 def resumen_lateral(lineas: list[tuple]) -> None:
     """lineas: [(etiqueta, valor, color)] para el pie de la barra lateral."""
     filas = "".join(
-        f'<div class="linea"><span class="etq">{e}</span>'
-        f'<span class="val" style="color:{c}">{v}</span></div>'
+        f'<div class="linea"><span class="etq">{esc(e)}</span>'
+        f'<span class="val" style="color:{c}">{esc(v)}</span></div>'
         for e, v, c in lineas
     )
     st.markdown(f'<div class="resumen">{filas}</div>', unsafe_allow_html=True)

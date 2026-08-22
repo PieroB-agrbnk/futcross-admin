@@ -7,7 +7,8 @@ Todas las consultas pasan por aca. Ninguna pantalla arma queries por su cuenta.
 from __future__ import annotations
 
 import os
-from datetime import date
+import re
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import streamlit as st
@@ -61,8 +62,50 @@ def _iso(valor):
 
 
 # ---------------------------------------------------------------------
+# Cache
+#
+# Streamlit vuelve a ejecutar el script entero en cada clic y en cada
+# tecla. Sin cache, abrir el Panel disparaba una decena de consultas a
+# Supabase por interaccion. Se guardan las lecturas por unos segundos y
+# se tira todo el cache apenas se escribe algo, para que el usuario
+# nunca vea un dato viejo despues de guardar.
+#
+# Lo que decide si alguien entra a entrenar (paquete vigente, si ya
+# marco hoy) queda deliberadamente FUERA del cache: ahi un dato de hace
+# 30 segundos podria regalar una sesion.
+# ---------------------------------------------------------------------
+CACHE_CORTO = 30     # movimiento del dia: asistencias, paquetes, alumnos
+CACHE_LARGO = 300    # catalogos que casi no cambian: planes, grupos, sedes
+
+
+def _cache(ttl: int, entradas: int = 64):
+    return st.cache_data(ttl=ttl, show_spinner=False, max_entries=entradas)
+
+
+def invalidar_cache() -> None:
+    """Se llama despues de cada escritura. Sin esto, vender un paquete no
+    se veria reflejado en las listas hasta que venciera el TTL."""
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+
+
+def _escapar_filtro(texto: str) -> str:
+    """Limpia el texto que va dentro de un `or_()` de PostgREST.
+
+    La coma separa condiciones y el parentesis las agrupa: un alumno que
+    busca "Perez, Juan" partia el filtro en dos y PostgREST devolvia un
+    error 400 en vez de resultados. El punto y el asterisco tambien
+    tienen significado, asi que se van.
+    """
+    return re.sub(r'[,()."*\\]', " ", texto or "").strip()
+
+
+# ---------------------------------------------------------------------
 # Planes
 # ---------------------------------------------------------------------
+@_cache(CACHE_LARGO)
 def listar_planes(solo_activos: bool = True) -> pd.DataFrame:
     q = _tabla("planes").select("*").order("sesiones")
     if solo_activos:
@@ -71,13 +114,15 @@ def listar_planes(solo_activos: bool = True) -> pd.DataFrame:
 
 
 def crear_plan(nombre, sesiones, vigencia_dias, precio, descripcion=None):
-    return _tabla("planes").insert({
+    r = _tabla("planes").insert({
         "nombre": nombre.strip().upper(),
         "sesiones": int(sesiones),
         "vigencia_dias": int(vigencia_dias),
         "precio": float(precio),
         "descripcion": descripcion,
     }).execute().data
+    invalidar_cache()
+    return r
 
 
 def plan(plan_id: str) -> dict | None:
@@ -99,22 +144,67 @@ def eliminar_plan(plan_id: str) -> None:
             "No se puede borrar sin romper esos pedidos. Usa 'Ocultar del catalogo'."
         )
     _tabla("planes").delete().eq("id", plan_id).execute()
+    invalidar_cache()
 
 
+@_cache(CACHE_LARGO)
 def paquetes_con_plan(plan_id: str) -> int:
-    """Cuantas ventas usan este plan. Sirve para avisar antes de editarlo."""
+    """Cuantas ventas usan este plan. Sirve para avisar antes de editarlo.
+
+    Se pide `count="exact"` con head: PostgREST devuelve solo el numero,
+    sin traer las filas. Antes bajaba todos los ids para contarlos.
+    """
     r = (_tabla("paquetes").select("id", count="exact")
-         .eq("plan_id", plan_id).execute())
+         .eq("plan_id", plan_id).limit(1).execute())
     return r.count or 0
 
 
 def actualizar_plan(plan_id: str, cambios: dict):
-    return _tabla("planes").update(cambios).eq("id", plan_id).execute().data
+    r = _tabla("planes").update(cambios).eq("id", plan_id).execute().data
+    invalidar_cache()
+    return r
+
+
+# ---------------------------------------------------------------------
+# Configuracion (claves de acceso)
+#
+# Sin cache a proposito: si se cambia un PIN, tiene que valer al
+# instante en todas las pestanas abiertas.
+# ---------------------------------------------------------------------
+def leer_config(clave: str) -> str | None:
+    try:
+        r = (_tabla("config").select("valor")
+             .eq("clave", clave).limit(1).execute().data)
+        return r[0]["valor"] if r else None
+    except Exception:
+        # La migracion 019 todavia no se corrio: se cae a los secretos
+        return None
+
+
+def guardar_config(clave: str, valor: str, quien: str = "admin") -> None:
+    _tabla("config").upsert({
+        "clave": clave,
+        "valor": valor,
+        "actualizado_en": datetime.now(timezone.utc).isoformat(),
+        "actualizado_por": quien,
+    }, on_conflict="clave").execute()
+    invalidar_cache()
+
+
+def config_actualizada(clave: str) -> dict | None:
+    """Cuando y quien cambio esta clave por ultima vez."""
+    try:
+        r = (_tabla("config").select("actualizado_en,actualizado_por")
+             .eq("clave", clave).limit(1).execute().data)
+        return r[0] if r else None
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------
 # Grupos (sede + horario + genero + dias de entrenamiento)
 # ---------------------------------------------------------------------
+@_cache(CACHE_LARGO)
 def listar_grupos(solo_activos: bool = True) -> pd.DataFrame:
     try:
         q = _tabla("grupos").select("*").order("sede")
@@ -132,7 +222,7 @@ def grupo(grupo_id: str) -> dict | None:
 
 
 def crear_grupo(nombre, sede, genero, hora, dias):
-    return _tabla("grupos").insert({
+    r = _tabla("grupos").insert({
         "nombre": nombre.strip().upper(),
         "sede": sede.strip().upper(),
         "genero": genero,
@@ -140,10 +230,14 @@ def crear_grupo(nombre, sede, genero, hora, dias):
         "dias": dias,
         "dias_por_semana": len(dias.split()),
     }).execute().data
+    invalidar_cache()
+    return r
 
 
 def actualizar_grupo(grupo_id: str, cambios: dict):
-    return _tabla("grupos").update(cambios).eq("id", grupo_id).execute().data
+    r = _tabla("grupos").update(cambios).eq("id", grupo_id).execute().data
+    invalidar_cache()
+    return r
 
 
 # ---------------------------------------------------------------------
@@ -151,19 +245,25 @@ def actualizar_grupo(grupo_id: str, cambios: dict):
 # ---------------------------------------------------------------------
 def crear_alumno(datos: dict):
     limpio = {k: _iso(v) for k, v in datos.items() if v not in (None, "")}
-    return _tabla("alumnos").insert(limpio).execute().data
+    r = _tabla("alumnos").insert(limpio).execute().data
+    invalidar_cache()
+    return r
 
 
 def actualizar_alumno(alumno_id: str, cambios: dict):
     limpio = {k: _iso(v) for k, v in cambios.items()}
-    return _tabla("alumnos").update(limpio).eq("id", alumno_id).execute().data
+    r = _tabla("alumnos").update(limpio).eq("id", alumno_id).execute().data
+    invalidar_cache()
+    return r
 
 
+@_cache(CACHE_CORTO, entradas=128)
 def alumno(alumno_id: str) -> dict | None:
     r = _tabla("alumnos").select("*").eq("id", alumno_id).limit(1).execute().data
     return r[0] if r else None
 
 
+@_cache(CACHE_CORTO)
 def panel_alumnos(solo_activos: bool = True) -> pd.DataFrame:
     """Una fila por alumno con su paquete mas relevante (vista v_alumnos_estado)."""
     q = _tabla("v_alumnos_estado").select("*").order("apellidos")
@@ -173,20 +273,35 @@ def panel_alumnos(solo_activos: bool = True) -> pd.DataFrame:
 
 
 def buscar_alumnos(texto: str, limite: int = 25) -> pd.DataFrame:
-    """Busca por nombre, apellido, codigo, DNI o telefono."""
-    texto = (texto or "").strip()
-    if not texto:
+    """Busca por nombre, apellido, codigo, DNI o telefono.
+
+    Busca cada palabra por separado y se queda con los alumnos que
+    cumplen todas: escribir "juan perez" encuentra a Juan Perez aunque
+    el nombre y el apellido esten en columnas distintas.
+    """
+    limpio = _escapar_filtro(texto)
+    if not limpio:
         return panel_alumnos().head(limite)
-    patron = f"%{texto}%"
-    filtro = ",".join([
-        f"nombres.ilike.{patron}",
-        f"apellidos.ilike.{patron}",
-        f"codigo.ilike.{patron}",
-        f"dni.ilike.{patron}",
-        f"telefono.ilike.{patron}",
-    ])
-    rows = _tabla("v_alumnos_estado").select("*").or_(filtro).limit(limite).execute().data
-    return _df(rows)
+
+    encontrados: dict = {}
+    resultado: set | None = None
+    for palabra in limpio.split()[:4]:
+        patron = f"%{palabra}%"
+        filtro = ",".join([
+            f"nombres.ilike.{patron}",
+            f"apellidos.ilike.{patron}",
+            f"codigo.ilike.{patron}",
+            f"dni.ilike.{patron}",
+            f"telefono.ilike.{patron}",
+        ])
+        rows = (_tabla("v_alumnos_estado").select("*")
+                .or_(filtro).limit(200).execute().data) or []
+        encontrados.update({r["alumno_id"]: r for r in rows})
+        ids = set(r["alumno_id"] for r in rows)
+        resultado = ids if resultado is None else (resultado & ids)
+        if not resultado:
+            return pd.DataFrame()
+    return _df([encontrados[i] for i in sorted(resultado or ())][:limite])
 
 
 def identificar(texto: str) -> list[dict]:
@@ -209,7 +324,10 @@ def identificar(texto: str) -> list[dict]:
         if exacto:
             return exacto
 
-    patron = f"%{texto}%"
+    limpio = _escapar_filtro(texto)
+    if not limpio:
+        return []
+    patron = f"%{limpio}%"
     return _tabla("v_alumnos_estado").select("*").or_(
         f"nombres.ilike.{patron},apellidos.ilike.{patron},codigo.ilike.{patron}"
     ).limit(8).execute().data
@@ -218,6 +336,7 @@ def identificar(texto: str) -> list[dict]:
 # ---------------------------------------------------------------------
 # Paquetes
 # ---------------------------------------------------------------------
+@_cache(CACHE_CORTO, entradas=128)
 def paquetes_de(alumno_id: str) -> pd.DataFrame:
     rows = (_tabla("v_paquetes").select("*")
             .eq("alumno_id", alumno_id).order("fecha_inicio", desc=True).execute().data)
@@ -244,11 +363,73 @@ def ultimo_paquete(alumno_id: str) -> dict | None:
     return rows[0] if rows else None
 
 
-def listar_paquetes(estados: list[str] | None = None) -> pd.DataFrame:
+@_cache(CACHE_CORTO)
+def listar_paquetes(estados: list[str] | None = None,
+                    desde: date | None = None,
+                    hasta: date | None = None) -> pd.DataFrame:
+    """Pedidos, opcionalmente filtrados por estado y por fecha de inicio.
+
+    El filtro de fechas lo resuelve Postgres. Reportes lo usa para no
+    bajar el historico completo de la academia cada vez que se mueve el
+    rango: con dos anios de ventas eso eran miles de filas para mostrar
+    las de un mes.
+    """
     q = _tabla("v_paquetes").select("*").order("fecha_fin", desc=True)
     if estados:
         q = q.in_("estado_real", estados)
+    if desde:
+        q = q.gte("fecha_inicio", desde.isoformat())
+    if hasta:
+        q = q.lte("fecha_inicio", hasta.isoformat())
     return _df(q.execute().data)
+
+
+@_cache(CACHE_CORTO)
+def paquetes_por_cobrar() -> pd.DataFrame:
+    """Pedidos registrados como pendientes de pago.
+
+    Al vender se puede marcar "Pendiente", pero despues ese pedido no
+    aparecia en ninguna pantalla: la plata quedaba sin cobrar y sin
+    rastro. Esta consulta es la que alimenta el aviso del Panel.
+    """
+    try:
+        rows = (_tabla("v_paquetes").select("*")
+                .eq("pagado", False)
+                .neq("estado_real", "CANCELADO")
+                .order("fecha_limite_pago", desc=False).execute().data)
+    except Exception:
+        # Antes de la migracion 019 no existe fecha_limite_pago
+        try:
+            rows = (_tabla("v_paquetes").select("*")
+                    .eq("pagado", False)
+                    .neq("estado_real", "CANCELADO")
+                    .order("fecha_pedido", desc=True).execute().data)
+        except Exception:
+            return pd.DataFrame()
+    return _df(rows)
+
+
+def registrar_abono(paquete_id: str, monto: float, total: bool = False):
+    """Anota lo que el cliente entrego.
+
+    `pagado` no se toca aca: lo calcula un trigger en la base a partir
+    del monto entregado. Asi no puede quedar un pedido marcado como
+    pagado con saldo pendiente.
+    """
+    pq = paquete(paquete_id) or {}
+    precio = float(pq.get("precio") or 0)
+    entregado = float(pq.get("monto_entregado") or 0)
+    nuevo = precio if total else min(precio, entregado + float(monto))
+
+    r = (_tabla("paquetes").update({"monto_entregado": nuevo})
+         .eq("id", paquete_id).execute().data)
+    invalidar_cache()
+    return r
+
+
+def marcar_pagado(paquete_id: str):
+    """Salda el pedido completo. Se conserva por compatibilidad."""
+    return registrar_abono(paquete_id, 0, total=True)
 
 
 def crear_paquete(alumno_id, plan: dict, fecha_inicio: date, precio: float,
@@ -256,7 +437,10 @@ def crear_paquete(alumno_id, plan: dict, fecha_inicio: date, precio: float,
                   fecha_pedido: date | None = None, sede: str | None = None,
                   dias_asiste: str | None = None, vendedor: str | None = None,
                   tipo: str = "NUEVO", sesiones: int | None = None,
-                  vigencia_dias: int | None = None, grupo_id: str | None = None):
+                  vigencia_dias: int | None = None, grupo_id: str | None = None,
+                  precio_lista: float | None = None,
+                  monto_entregado: float | None = None,
+                  fecha_limite_pago: date | None = None):
     """Registra la venta con todos los datos del pedido.
 
     sesiones y vigencia_dias permiten ajustar el plan para una venta puntual
@@ -269,7 +453,7 @@ def crear_paquete(alumno_id, plan: dict, fecha_inicio: date, precio: float,
     fecha_fin = logic.fecha_fin_por_calendario(fecha_inicio, total,
                                                dias_asiste, dias)
 
-    return _tabla("paquetes").insert({
+    r = _tabla("paquetes").insert({
         "alumno_id": alumno_id,
         "plan_id": plan.get("id"),
         "plan_nombre": plan["nombre"],
@@ -277,7 +461,15 @@ def crear_paquete(alumno_id, plan: dict, fecha_inicio: date, precio: float,
         "fecha_pedido": (fecha_pedido or fecha_inicio).isoformat(),
         "fecha_inicio": fecha_inicio.isoformat(),
         "fecha_fin": fecha_fin.isoformat(),
+        "precio_lista": float(precio_lista if precio_lista is not None else precio),
         "precio": float(precio),
+        # Si no se dice cuanto entrego, se asume que pago todo o nada,
+        # como funcionaba antes de que existieran los pagos parciales.
+        "monto_entregado": float(
+            monto_entregado if monto_entregado is not None
+            else (precio if pagado else 0)),
+        "fecha_limite_pago": (fecha_limite_pago.isoformat()
+                              if fecha_limite_pago else None),
         "medio_pago": medio_pago,
         "pagado": bool(pagado),
         "sede": sede,
@@ -287,11 +479,15 @@ def crear_paquete(alumno_id, plan: dict, fecha_inicio: date, precio: float,
         "tipo": tipo,
         "observacion": observacion,
     }).execute().data
+    invalidar_cache()
+    return r
 
 
 def actualizar_paquete(paquete_id: str, cambios: dict):
     limpio = {k: _iso(v) for k, v in cambios.items()}
-    return _tabla("paquetes").update(limpio).eq("id", paquete_id).execute().data
+    r = _tabla("paquetes").update(limpio).eq("id", paquete_id).execute().data
+    invalidar_cache()
+    return r
 
 
 def siguiente_pedido() -> int:
@@ -301,23 +497,32 @@ def siguiente_pedido() -> int:
     return (r[0]["nro_pedido"] or 0) + 1 if r else 1
 
 
+@_cache(CACHE_LARGO)
 def vendedores() -> list:
-    """Los vendedores que ya se usaron, para no escribirlos de nuevo."""
-    r = _tabla("paquetes").select("vendedor").execute().data or []
+    """Los vendedores que ya se usaron, para no escribirlos de nuevo.
+
+    Se piden solo los ultimos 500 pedidos: los nombres se repiten y no
+    hace falta recorrer el historico entero para armar la lista.
+    """
+    r = (_tabla("paquetes").select("vendedor")
+         .order("creado_en", desc=True).limit(500).execute().data) or []
     return sorted({(x.get("vendedor") or "").strip() for x in r if x.get("vendedor")})
 
 
+@_cache(CACHE_LARGO)
 def sedes() -> list:
-    r = _tabla("alumnos").select("sede").execute().data or []
+    r = (_tabla("alumnos").select("sede").limit(1000).execute().data) or []
     vistas = {(x.get("sede") or "").strip() for x in r if x.get("sede")}
     return sorted(vistas | {"SURQUILLO"})
 
 
 def cancelar_paquete(paquete_id: str, motivo: str):
-    return _tabla("paquetes").update({
+    r = _tabla("paquetes").update({
         "estado": "CANCELADO",
         "observacion": motivo,
     }).eq("id", paquete_id).execute().data
+    invalidar_cache()
+    return r
 
 
 # ---------------------------------------------------------------------
@@ -339,6 +544,7 @@ def congelar(paquete_id: str, alumno_id: str, motivo: str, detalle: str,
         "fecha_alta_prevista": alta_prevista.isoformat() if alta_prevista else None,
     }).execute()
     _tabla("paquetes").update({"estado": "CONGELADO"}).eq("id", paquete_id).execute()
+    invalidar_cache()
 
 
 def reactivar(congelamiento_id: str, hasta: date) -> int:
@@ -376,9 +582,11 @@ def reactivar(congelamiento_id: str, hasta: date) -> int:
         "activo": False,
     }).eq("id", congelamiento_id).execute()
 
+    invalidar_cache()
     return dias
 
 
+@_cache(CACHE_CORTO)
 def congelamientos(activos: bool | None = True) -> pd.DataFrame:
     q = _tabla("congelamientos").select("*, alumnos(codigo,nombres,apellidos,telefono)")
     if activos is not None:
@@ -400,13 +608,20 @@ def reactivar_automaticos() -> int:
     instante y no haya que esperar al dia siguiente.
     """
     try:
-        r = supabase().rpc("fc_reactivar_previstos", {}).execute()
-        return int(r.data or 0)
+        # Era `supabase()`, que no existe en este modulo: el NameError
+        # caia en el except de abajo y las altas automaticas nunca
+        # corrian desde la app, solo de madrugada por pg_cron.
+        r = cliente().rpc("fc_reactivar_previstos", {}).execute()
+        n = int(r.data or 0)
     except Exception:
         # Si la migracion 014 aun no se corrio, no pasa nada
         return 0
+    if n:
+        invalidar_cache()
+    return n
 
 
+@_cache(CACHE_CORTO)
 def congelados_que_vuelven(hasta: date) -> pd.DataFrame:
     """Congelamientos cuya fecha prevista de alta ya llego o esta por llegar."""
     try:
@@ -452,16 +667,21 @@ def marcar_asistencia(alumno_id: str, paquete_id: str, sede: str | None = None,
     }
     if fecha:
         payload["fecha"] = fecha.isoformat()
-    return _tabla("asistencias").insert(payload).execute().data
+    r = _tabla("asistencias").insert(payload).execute().data
+    invalidar_cache()
+    return r
 
 
 def anular_asistencia(asistencia_id: str, quien: str = "admin"):
     """Al anular, la sesion vuelve automaticamente al saldo del alumno."""
-    return _tabla("asistencias").update({
+    r = _tabla("asistencias").update({
         "anulada": True, "anulada_por": quien,
     }).eq("id", asistencia_id).execute().data
+    invalidar_cache()
+    return r
 
 
+@_cache(CACHE_CORTO)
 def asistencias(desde: date, hasta: date, incluir_anuladas: bool = False) -> pd.DataFrame:
     q = (_tabla("v_asistencias").select("*")
          .gte("fecha", desde.isoformat()).lte("fecha", hasta.isoformat()))
@@ -470,13 +690,49 @@ def asistencias(desde: date, hasta: date, incluir_anuladas: bool = False) -> pd.
     return _df(q.order("fecha", desc=True).order("hora", desc=True).execute().data)
 
 
+@_cache(CACHE_CORTO, entradas=128)
+def asistencias_de(alumno_id: str, desde: date, hasta: date) -> pd.DataFrame:
+    """Las asistencias de UN alumno.
+
+    La ficha usaba `asistencias(desde, hasta)` y filtraba en pandas:
+    bajaba seis meses de asistencias de toda la academia para dibujar el
+    mapa de calor de una sola persona. Ahora filtra Postgres.
+    """
+    rows = (_tabla("v_asistencias").select("*")
+            .eq("alumno_id", alumno_id).eq("anulada", False)
+            .gte("fecha", desde.isoformat()).lte("fecha", hasta.isoformat())
+            .order("fecha", desc=True).order("hora", desc=True).execute().data)
+    return _df(rows)
+
+
 def registrar_bloqueo(alumno_id: str | None, texto: str, motivo: str):
     """Deja constancia de quien quiso entrenar sin paquete valido."""
-    return _tabla("bloqueos").insert({
+    r = _tabla("bloqueos").insert({
         "alumno_id": alumno_id, "texto": texto, "motivo": motivo,
     }).execute().data
+    invalidar_cache()
+    return r
 
 
+def intentos_fallidos_recientes(minutos: int = 15) -> int:
+    """Cuantos PIN fallidos hubo en los ultimos minutos, en toda la instalacion.
+
+    El contador de intentos vivia en `st.session_state`, o sea en la
+    pestana del navegador: abrir una ventana nueva lo reiniciaba y el
+    bloqueo no servia de nada. Este cuenta contra la base, que es la
+    misma para todos.
+    """
+    try:
+        desde = datetime.now(timezone.utc) - timedelta(minutes=minutos)
+        r = (_tabla("bloqueos").select("id", count="exact")
+             .eq("motivo", "PIN_FALLIDO")
+             .gte("creado_en", desde.isoformat()).limit(1).execute())
+        return int(r.count or 0)
+    except Exception:
+        return 0
+
+
+@_cache(CACHE_CORTO)
 def bloqueos(desde: date, hasta: date) -> pd.DataFrame:
     rows = (_tabla("bloqueos").select("*, alumnos(codigo,nombres,apellidos,telefono)")
             .gte("fecha", desde.isoformat()).lte("fecha", hasta.isoformat())

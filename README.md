@@ -124,9 +124,42 @@ db.py             consultas a Supabase (nada de SQL suelto en las pantallas)
 logic.py          reglas puras: vigencias, congelamientos, alertas
 theme.py          identidad visual y el marcador de sesiones
 schema.sql        tablas, índices y vistas (se corre una sola vez)
+migracion-0NN.sql cambios posteriores, en orden. La 018 son solo índices
 test_logic.py     25 pruebas de las reglas -> python test_logic.py
 seed_demo.py      datos de prueba, borrar cuando entren datos reales
 ```
+
+---
+
+## Novedades de la versión 2.8
+
+**Hay que correr `migracion-018.sql` en Supabase.** Solo crea índices: no toca
+ninguna columna, se puede correr con la app funcionando y no rompe nada si se
+corre dos veces. El más importante es el de `asistencias(paquete_id)`: la vista
+`v_paquetes` cuenta las sesiones usadas con un `count(*)` por cada paquete, y sin
+ese índice Postgres recorría la tabla entera de asistencias una vez por paquete.
+
+Lo demás no necesita ninguna acción:
+
+- **Las altas automáticas de congelamiento ya funcionan desde la app.** Llamaban
+  a una función que no existía; el error quedaba tapado y las altas solo corrían
+  de madrugada por `pg_cron`.
+- **Buscar con coma ya no falla.** Escribir "Perez, Juan" rompía el filtro y
+  devolvía error en vez de resultados. Además ahora se puede buscar por nombre y
+  apellido juntos aunque estén en columnas distintas.
+- **Pendientes de cobro.** Los pedidos marcados como "Pendiente" no aparecían en
+  ninguna pantalla: se vendían, el alumno entrenaba y la plata quedaba sin
+  cobrar y sin rastro. Ahora salen en el Panel, con antigüedad y botón para
+  marcarlos pagados.
+- **La sesión se cierra sola a las 2 horas sin uso**, para que la tablet de la
+  cancha no quede con los ingresos y los precios a la vista.
+- **El bloqueo por PIN fallido ahora cuenta contra la base.** Antes vivía en la
+  pestaña del navegador: abrir una ventana nueva lo reiniciaba.
+- **Los CSV abren bien en Excel** (punto y coma y tildes correctas), sin pasar
+  por el asistente de importación.
+- **La app va más rápida:** las consultas se guardan unos segundos y se tiran
+  apenas se graba algo. Lo que decide si alguien entra a entrenar (paquete
+  vigente y si ya marcó hoy) queda fuera del caché a propósito.
 
 ## Mantenimiento
 

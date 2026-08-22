@@ -17,6 +17,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+import acceso      # noqa: E402
 import db          # noqa: E402
 import logic       # noqa: E402
 import theme       # noqa: E402
@@ -25,7 +26,7 @@ theme.aplicar_estilos()
 
 # Se muestra en la barra lateral. Sirve para saber de un vistazo si la version
 # que estas viendo en la nube es la misma que tienes en tu computadora.
-VERSION = "2.5"
+VERSION = "2.9"
 
 DIAS_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
 TURNOS = ["MANANA", "TARDE", "NOCHE"]
@@ -74,17 +75,21 @@ def selector_de_grupo(etiqueta="Grupo", clave=None, grupo_actual=None,
     if not previos:
         previos = disponibles[:dias_del_plan] if dias_del_plan else disponibles
 
+    # La clave incluye el grupo: al cambiar de grupo, Streamlit crea un
+    # widget nuevo y vuelve a proponer los dias correctos. Sin esto, los
+    # dias del grupo anterior no existen en la lista nueva y queda vacia.
     elegidos = c2.multiselect(
         "Dias que asiste", disponibles, default=previos,
-        key=f"{clave}_dias" if clave else None,
-        help=f"El grupo entrena {' '.join(disponibles)}. "
-             "Marca solo los dias que viene este alumno.")
+        key=f"{clave}_dias_{g['id']}" if clave else None,
+        help=f"Este grupo entrena {' '.join(disponibles)}. "
+             "Marca solo los dias que viene este alumno; puede ser uno solo.")
 
-    if dias_del_plan and elegidos and len(elegidos) != dias_del_plan:
-        c2.warning(f"Este plan es de {dias_del_plan} "
+    if not elegidos:
+        c2.error("Marca al menos un dia: de ahi sale la fecha de vencimiento.")
+    elif dias_del_plan and len(elegidos) != dias_del_plan:
+        c2.caption(f"Nota: el plan es de {dias_del_plan} "
                    f"{'dia' if dias_del_plan == 1 else 'dias'} por semana y "
-                   f"marcaste {len(elegidos)}. El vencimiento se calcula con "
-                   "los dias marcados.")
+                   f"marcaste {len(elegidos)}. Se respeta lo que marcaste.")
 
     # Se ordenan como la semana, no como se hizo clic
     orden = {d: i for i, d in enumerate(DIAS_SEMANA)}
@@ -104,6 +109,41 @@ def secreto(clave, defecto=None):
     return db.secreto(clave, defecto)
 
 
+def esc(valor) -> str:
+    """Atajo al escapador de theme, para el HTML que se arma en estas pantallas."""
+    return theme.esc(valor)
+
+
+def descargar_csv(etiqueta: str, datos: pd.DataFrame, archivo: str, clave=None) -> None:
+    """Boton de descarga en el formato que abre bien el Excel de la oficina.
+
+    Excel en configuracion regional peruana usa el punto y coma como
+    separador: con comas metia todo en la columna A y habia que usar el
+    asistente de importacion. El BOM (utf-8-sig) es lo que hace que las
+    tildes y la enie se vean bien al abrirlo con doble clic.
+    """
+    st.download_button(
+        etiqueta,
+        datos.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
+        archivo, "text/csv", key=clave)
+
+
+def con_alertas(alumnos: pd.DataFrame) -> pd.DataFrame:
+    """Agrega las columnas nivel y motivo del semaforo de renovacion.
+
+    La misma cuenta la hacian por separado el Panel, Renovaciones y el
+    resumen de la barra lateral. Estaba escrita tres veces, con el
+    riesgo de que se fueran despegando entre si.
+    """
+    if alumnos.empty:
+        return alumnos
+    alertas = [logic.alerta_renovacion(f) for f in alumnos.to_dict("records")]
+    alumnos = alumnos.copy()
+    alumnos["nivel"] = [a[0] for a in alertas]
+    alumnos["motivo"] = [a[1] for a in alertas]
+    return alumnos
+
+
 # =====================================================================
 # ACCESO
 # =====================================================================
@@ -112,7 +152,7 @@ def secreto(clave, defecto=None):
 # poder cambiar precios: eso es plata y es del administrador.
 PERMISOS = {
     "admin": ["Panel", "Marcar asistencia", "Renovaciones", "Alumnos",
-              "Paquetes", "Congelamientos", "Reportes", "Planes"],
+              "Paquetes", "Congelamientos", "Reportes", "Planes", "Accesos"],
     "entrenador": ["Panel", "Marcar asistencia", "Alumnos", "Renovaciones"],
 }
 
@@ -141,31 +181,95 @@ def paginas_permitidas() -> list:
 # quien este probando claves al azar.
 INTENTOS_MAX = 5
 CASTIGO_SEGUNDOS = 120
+VENTANA_INTENTOS = 15    # minutos que se miran hacia atras para contar fallos
+
+# Una sesion de administracion abierta en la tablet de la cancha se cierra
+# sola tras dos horas sin uso. Sin esto quedaba abierta hasta que alguien
+# se acordara de salir, con los ingresos y los precios a la vista.
+INACTIVIDAD_MAX = 2 * 60 * 60
+
+
+# Las claves se guardan hasheadas en la tabla `config` y se cambian desde
+# la pantalla Accesos. Si todavia no hay nada guardado (recien aplicado el
+# parche), se usan las de los secretos del servidor, para que nadie quede
+# afuera. Cambiar una clave desde el panel la mueve a la base y a partir de
+# ahi manda esa.
+CLAVES_PIN = {"admin": "pin_admin", "entrenador": "pin_entrenador"}
+SECRETOS_PIN = {"admin": "ADMIN_PIN", "entrenador": "ENTRENADOR_PIN"}
+
+
+def pin_guardado(rol_pin: str) -> str | None:
+    """Devuelve el hash de la base, o el PIN suelto de los secretos."""
+    try:
+        guardado = db.leer_config(CLAVES_PIN[rol_pin])
+    except Exception:
+        guardado = None
+    return guardado or secreto(SECRETOS_PIN[rol_pin])
+
+
+def comparar_pin(escrito: str, guardado: str | None) -> bool:
+    """Acepta las dos formas: hash de la base o PIN plano de los secretos."""
+    if not escrito or not guardado:
+        return False
+    if acceso.es_hash(guardado):
+        return acceso.verificar_pin(escrito, guardado)
+    # compare_digest tarda lo mismo acierte o falle
+    return hmac.compare_digest(str(escrito), str(guardado))
 
 
 def _control_acceso() -> dict:
     return st.session_state.setdefault("acceso", {"fallos": 0, "hasta": 0.0})
 
 
+def fallos_totales() -> int:
+    """Fallos de esta pestana y de cualquier otra, en la ventana de tiempo.
+
+    El contador de `session_state` se reinicia con solo abrir una pestana
+    nueva, asi que por si solo no frena a nadie. El de la base cuenta los
+    intentos de toda la instalacion.
+    """
+    control = _control_acceso()
+    return max(control["fallos"], db.intentos_fallidos_recientes(VENTANA_INTENTOS))
+
+
 def segundos_de_castigo() -> int:
-    return max(0, int(_control_acceso()["hasta"] - time.time()))
+    """Bloqueado si esta pestana ya cumplio su castigo, o si en los ultimos
+    15 minutos hubo demasiados fallos en cualquier pestana."""
+    propio = max(0, int(_control_acceso()["hasta"] - time.time()))
+    if propio:
+        return propio
+    if fallos_totales() >= INTENTOS_MAX:
+        return CASTIGO_SEGUNDOS
+    return 0
 
 
 def registrar_fallo() -> None:
     control = _control_acceso()
     control["fallos"] += 1
 
+    # Se anota cada fallo, no solo el ultimo: es lo que permite contarlos
+    # entre pestanas distintas. Llegado el tope el ingreso queda bloqueado,
+    # asi que la tabla no puede crecer sin control.
+    try:
+        db.registrar_bloqueo(
+            None, f"Intento de acceso al panel (fallo {control['fallos']})",
+            "PIN_FALLIDO")
+    except Exception:
+        pass
+
     if control["fallos"] >= INTENTOS_MAX:
         exceso = control["fallos"] - INTENTOS_MAX
         control["hasta"] = time.time() + CASTIGO_SEGUNDOS * (2 ** min(exceso, 5))
-        # Se anota solo al llegar al tope, no en cada intento, para que nadie
-        # pueda llenar la tabla a punta de claves equivocadas.
-        try:
-            db.registrar_bloqueo(
-                None, f"Intento de acceso al panel ({control['fallos']} fallos)",
-                "PIN_FALLIDO")
-        except Exception:
-            pass
+
+
+def sesion_expirada() -> bool:
+    """Cierra la sesion si estuvo mas de INACTIVIDAD_MAX sin tocar nada."""
+    ultimo = st.session_state.get("ultimo_uso")
+    ahora = time.time()
+    if ultimo and ahora - ultimo > INACTIVIDAD_MAX:
+        return True
+    st.session_state["ultimo_uso"] = ahora
+    return False
 
 
 def pantalla_login() -> None:
@@ -179,8 +283,8 @@ def pantalla_login() -> None:
 
     # Sin PIN configurado no se entra. Antes habia un valor por defecto y eso
     # significaba que una instalacion mal configurada quedaba abierta.
-    pin_admin = secreto("ADMIN_PIN")
-    pin_entrenador = secreto("ENTRENADOR_PIN")
+    pin_admin = pin_guardado("admin")
+    pin_entrenador = pin_guardado("entrenador")
     if not pin_admin:
         st.error(
             "Falta configurar ADMIN_PIN. Agregalo a .streamlit/secrets.toml "
@@ -206,18 +310,18 @@ def pantalla_login() -> None:
         # compare_digest tarda lo mismo acierte o falle, asi el tiempo de
         # respuesta no delata cuantos caracteres eran correctos. Se comparan
         # los dos PIN siempre, para que tampoco se note cual acerto.
-        acierta_admin = bool(pin) and hmac.compare_digest(str(pin), str(pin_admin))
-        acierta_entrenador = (bool(pin) and bool(pin_entrenador)
-                              and hmac.compare_digest(str(pin), str(pin_entrenador)))
+        acierta_admin = comparar_pin(pin, pin_admin)
+        acierta_entrenador = comparar_pin(pin, pin_entrenador)
 
         if acierta_admin or acierta_entrenador:
             st.session_state["rol"] = "admin" if acierta_admin else "entrenador"
             st.session_state["pagina"] = "Panel"
+            st.session_state["ultimo_uso"] = time.time()
             st.session_state.pop("acceso", None)
             st.rerun()
         else:
             registrar_fallo()
-            restantes = INTENTOS_MAX - _control_acceso()["fallos"]
+            restantes = INTENTOS_MAX - fallos_totales()
             if restantes > 0:
                 st.error(f"PIN incorrecto. Te quedan {restantes} intentos.")
             else:
@@ -363,18 +467,27 @@ def pagina_panel() -> None:
     theme.cabecera("Panel de control", fecha_larga(hoy).upper(), "Como va el dia")
 
     alumnos = db.panel_alumnos()
-    asist_hoy = db.asistencias(hoy, hoy)
+
+    # Antes esta pantalla pedia las asistencias tres veces: las de hoy, las
+    # del mes y las de diez semanas. El rango largo ya contiene a los otros
+    # dos, asi que se trae una sola vez y los cortes se hacen en memoria.
     mes_ini = hoy.replace(day=1)
-    asist_mes = db.asistencias(mes_ini, hoy)
+    desde = min(hoy - timedelta(weeks=10), mes_ini)
+    historico = db.asistencias(desde, hoy)
+    if historico.empty:
+        asist_hoy = asist_mes = historico
+        fechas = pd.Series(dtype="object")
+    else:
+        fechas = historico["fecha"].map(logic.a_fecha)
+        asist_hoy = historico[fechas == hoy]
+        asist_mes = historico[fechas >= mes_ini]
 
     if alumnos.empty:
         theme.vacio("Todavia no hay alumnos",
                     "Empieza registrando el primero en la pantalla Alumnos.")
         return
 
-    alertas = alumnos.apply(lambda f: logic.alerta_renovacion(f.to_dict()), axis=1)
-    alumnos["nivel"] = [a[0] for a in alertas]
-    alumnos["motivo"] = [a[1] for a in alertas]
+    alumnos = con_alertas(alumnos)
 
     por_renovar = int(alumnos["nivel"].isin(["VENCIDO", "URGENTE"]).sum())
     vigentes = int((alumnos["estado_real"] == "ACTIVO").sum())
@@ -390,10 +503,9 @@ def pagina_panel() -> None:
     ])
 
     theme.seccion("Ritmo de la academia", "asistencias de las ultimas 9 semanas")
-    calor = db.asistencias(hoy - timedelta(weeks=10), hoy)
     conteos = {}
-    if not calor.empty:
-        for fecha, cantidad in calor.groupby("fecha").size().items():
+    if not historico.empty:
+        for fecha, cantidad in historico.groupby("fecha").size().items():
             conteos[logic.a_fecha(fecha)] = int(cantidad)
     st.markdown(theme.mapa_calor(conteos, hoy), unsafe_allow_html=True)
 
@@ -419,8 +531,9 @@ def pagina_panel() -> None:
                 st.markdown(
                     f'<div class="fila" style="border-left-color:{color}">'
                     f'{theme.avatar(f["alumno"])}'
-                    f'<div><div class="nom">{f["alumno"]}</div>'
-                    f'<div class="mot">{f["codigo"]} &middot; {f["motivo"]}</div></div>'
+                    f'<div><div class="nom">{esc(f["alumno"])}</div>'
+                    f'<div class="mot">{esc(f["codigo"])} &middot; '
+                    f'{esc(f["motivo"])}</div></div>'
                     f'<div class="der">{theme.chip(f["estado_real"])}</div></div>',
                     unsafe_allow_html=True)
             if len(criticos) > 12:
@@ -458,6 +571,78 @@ def pagina_panel() -> None:
                        theme.chip("CONGELADO"))
         st.caption("Reactivalos en la pantalla Congelamientos para que su paquete "
                    "vuelva a correr.")
+
+    # Pedidos que se registraron como "Pendiente" y despues no aparecian en
+    # ninguna pantalla: se vendia el paquete, el alumno entrenaba y la plata
+    # quedaba sin cobrar y sin rastro.
+    if es_admin():
+        deuda = db.paquetes_por_cobrar()
+        if not deuda.empty:
+            # El saldo, no el precio: si entrego la mitad, lo que falta
+            # cobrar es la otra mitad.
+            if "saldo" in deuda.columns:
+                deuda["_saldo"] = deuda["saldo"].fillna(deuda["precio"])
+            else:
+                deuda["_saldo"] = deuda["precio"]
+            total = float(deuda["_saldo"].fillna(0).sum())
+            theme.seccion("Pendientes de cobro",
+                          f"{len(deuda)} pedidos por S/ {total:,.2f}")
+            for _, d in deuda.head(10).iterrows():
+                limite = logic.a_fecha(d.get("fecha_limite_pago"))
+                pedido = logic.a_fecha(d.get("fecha_pedido") or d.get("fecha_inicio"))
+
+                if limite:
+                    faltan = (limite - hoy).days
+                    if faltan < 0:
+                        plazo = f"vencio hace {abs(faltan)} dias"
+                        color = theme.ROJO
+                    elif faltan == 0:
+                        plazo, color = "vence hoy", theme.ROJO
+                    else:
+                        plazo, color = f"vence en {faltan} dias", theme.AMBAR
+                else:
+                    dias = (hoy - pedido).days if pedido else None
+                    plazo = (f"hace {dias} dias" if dias and dias > 0 else "de hoy")
+                    color = theme.ROJO if dias and dias > 7 else theme.AMBAR
+
+                entregado = float(d.get("monto_entregado") or 0)
+                saldo_d = float(d.get("_saldo") or 0)
+                detalle_pago = f"debe S/ {saldo_d:,.2f}"
+                if entregado > 0:
+                    detalle_pago += f" (ya entrego S/ {entregado:,.2f})"
+
+                c1, c2 = st.columns([4, 1])
+                with c1:
+                    theme.fila(
+                        d["alumno"],
+                        f'{d.get("codigo", "")} · {d.get("plan_nombre", "")} · '
+                        f'{detalle_pago} · {plazo}',
+                        color)
+                if c2.button("Cobrar", key=f"pago_{d['id']}", width="stretch"):
+                    st.session_state["cobrando"] = d["id"]
+                    st.rerun()
+
+                if st.session_state.get("cobrando") == d["id"]:
+                    with st.form(f"form_cobro_{d['id']}"):
+                        h1, h2 = st.columns([2, 1])
+                        abono = h1.number_input(
+                            "Monto que entrega ahora (S/)", value=float(saldo_d),
+                            min_value=0.0, max_value=float(saldo_d), step=10.0)
+                        h2.write("")
+                        if h2.form_submit_button("Registrar", type="primary",
+                                                 width="stretch"):
+                            db.registrar_abono(d["id"], abono)
+                            st.session_state.pop("cobrando", None)
+                            restante = saldo_d - abono
+                            st.toast(
+                                "Pago completo" if restante <= 0
+                                else f"Abono registrado, quedan S/ {restante:,.2f}",
+                                icon="✅")
+                            st.rerun()
+
+            if len(deuda) > 10:
+                st.caption(f"y {len(deuda) - 10} pedidos mas. Estan todos en "
+                           "Paquetes filtrando por la columna Pagado.")
 
     theme.seccion("Intentos rechazados",
                   "ultimos 7 dias: puerta y accesos al panel")
@@ -546,8 +731,8 @@ def pagina_alumnos() -> None:
                     "esa fecha se recalcula el dia que se les da de alta, contando "
                     "las sesiones que les quedan."
                 )
-            st.download_button("Descargar CSV", vista.to_csv(index=False).encode("utf-8"),
-                               "futcross_alumnos.csv", "text/csv")
+            descargar_csv("Descargar CSV", vista, "futcross_alumnos.csv",
+                          clave="csv_alumnos")
 
             st.divider()
             st.subheader("Ficha del alumno")
@@ -630,18 +815,30 @@ def pagina_alumnos() -> None:
             if plan_elegido is not None:
 
                 r1, r2, r3 = st.columns(3)
-                precio_plan = r1.number_input("Monto cobrado (S/)", min_value=0.0,
-                                              value=float(plan_elegido["precio"]),
-                                              step=10.0)
-                medio_plan = r2.selectbox("Metodo de pago", MEDIOS_PAGO,
+                lista_plan = r1.number_input(
+                    "Precio de lista (S/)", min_value=0.0,
+                    value=float(plan_elegido["precio"]), step=10.0,
+                    key="lista_inscripcion")
+                precio_plan = r2.number_input(
+                    "Precio cobrado (S/)", min_value=0.0,
+                    value=float(plan_elegido["precio"]), step=1.0,
+                    key="cobrado_inscripcion",
+                    help="Lo que paga el cliente, con descuento si hubo")
+                medio_plan = r3.selectbox("Metodo de pago", MEDIOS_PAGO,
                                           key="medio_inscripcion")
-                recibido_plan = r3.text_input("Recibido por", placeholder="Ej. GARY",
+                if lista_plan - precio_plan > 0:
+                    d = lista_plan - precio_plan
+                    st.caption(f"Descuento: **S/ {d:,.2f}** "
+                               f"({d / lista_plan * 100:.1f}%)")
+                recibido_plan = st.text_input("Recibido por", placeholder="Ej. GARY",
                                               key="recibido_inscripcion")
                 vendedor_plan = st.text_input("Vendedor", key="vendedor_inscripcion",
                                               placeholder="Ej. EDDIMAR")
 
             if st.form_submit_button("Guardar alumno", type="primary"):
-                if not nombres or not apellidos:
+                if vender_ahora and plan_elegido is not None and not dias_grupo:
+                    st.error("Marca al menos un dia de entrenamiento.")
+                elif not nombres or not apellidos:
                     st.error("Nombres y apellidos son obligatorios.")
                 else:
                     try:
@@ -669,7 +866,8 @@ def pagina_alumnos() -> None:
                                 fecha_pedido=logic.hoy(), sede=None,
                                 dias_asiste=dias_grupo,
                                 vendedor=(vendedor_plan or "").strip().upper() or None,
-                                tipo="NUEVO", grupo_id=grupo_id)
+                                tipo="NUEVO", grupo_id=grupo_id,
+                                precio_lista=lista_plan)
                             fin_final = logic.fecha_fin_por_calendario(
                                 inicio_plan, int(plan_elegido["sesiones"]), dias_grupo,
                                 int(plan_elegido["vigencia_dias"]))
@@ -871,23 +1069,23 @@ def ficha_alumno(alumno_id: str) -> None:
                         "Dias congelados", "Precio", "Estado"]
         st.dataframe(hist, width="stretch", hide_index=True)
 
-    asis = db.asistencias(logic.hoy() - timedelta(days=180), logic.hoy())
-    if not asis.empty:
-        mias = asis[asis["alumno_id"] == alumno_id]
-        if not mias.empty:
-            theme.seccion("Su ritmo", "ultimas 9 semanas")
-            propios = {logic.a_fecha(f): int(n)
-                       for f, n in mias.groupby("fecha").size().items()}
-            st.markdown(theme.mapa_calor(propios, logic.hoy()), unsafe_allow_html=True)
-            st.write("")
-            st.markdown("**Ultimas asistencias**")
-            for _, r in mias.head(8).iterrows():
-                col1, col2 = st.columns([4, 1])
-                col1.write(f"{logic.a_fecha(r['fecha']).strftime('%d/%m/%Y')} · {r['hora']}")
-                if es_admin() and col2.button("Anular", key=f"anu_{r['id']}"):
-                    db.anular_asistencia(r["id"])
-                    st.success("Asistencia anulada. La sesion volvio al saldo del alumno.")
-                    st.rerun()
+    # Solo las de este alumno: antes se bajaban seis meses de asistencias de
+    # toda la academia para despues filtrar una sola persona en pandas.
+    mias = db.asistencias_de(alumno_id, logic.hoy() - timedelta(days=180), logic.hoy())
+    if not mias.empty:
+        theme.seccion("Su ritmo", "ultimas 9 semanas")
+        propios = {logic.a_fecha(f): int(n)
+                   for f, n in mias.groupby("fecha").size().items()}
+        st.markdown(theme.mapa_calor(propios, logic.hoy()), unsafe_allow_html=True)
+        st.write("")
+        st.markdown("**Ultimas asistencias**")
+        for _, r in mias.head(8).iterrows():
+            col1, col2 = st.columns([4, 1])
+            col1.write(f"{logic.a_fecha(r['fecha']).strftime('%d/%m/%Y')} · {r['hora']}")
+            if es_admin() and col2.button("Anular", key=f"anu_{r['id']}"):
+                db.anular_asistencia(r["id"])
+                st.success("Asistencia anulada. La sesion volvio al saldo del alumno.")
+                st.rerun()
 
 
 # =====================================================================
@@ -999,13 +1197,49 @@ def pagina_paquetes() -> None:
 
                 st.markdown("**Cobro**")
                 e1, e2, e3 = st.columns(3)
-                precio = e1.number_input("Monto total (S/)", value=float(plan["precio"]),
-                                         min_value=0.0, step=10.0)
-                medio = e2.selectbox("Metodo de pago", MEDIOS_PAGO)
-                recibido = e3.text_input("Recibido por", placeholder="Ej. GARY",
+                precio_lista = e1.number_input(
+                    "Precio de lista (S/)", value=float(plan["precio"]),
+                    min_value=0.0, step=10.0,
+                    help="El del catalogo. Se completa solo con el del plan.")
+                precio = e2.number_input(
+                    "Precio cobrado (S/)", value=float(plan["precio"]),
+                    min_value=0.0, step=1.0,
+                    help="Lo que realmente paga el cliente, con descuento si hubo")
+                medio = e3.selectbox("Metodo de pago", MEDIOS_PAGO)
+
+                dcto = precio_lista - precio
+                if dcto > 0:
+                    pct = dcto / precio_lista * 100 if precio_lista else 0
+                    st.caption(f"Descuento aplicado: **S/ {dcto:,.2f}** ({pct:.1f}%)")
+                elif dcto < 0:
+                    st.caption(f"Cobrado **S/ {abs(dcto):,.2f}** por encima del "
+                               "precio de lista.")
+
+                recibido = st.text_input("Recibido por", placeholder="Ej. GARY",
                                          help="Queda registrado como 'YAPE GARY'")
 
-                f1, f2, f3 = st.columns(3)
+                # FutCross a veces cobra la mitad ahora y la otra mitad en
+                # quince dias. Antes eso no habia donde registrarlo: marcar
+                # "Pendiente" hacia que lo que si entro a caja no contara.
+                g1, g2 = st.columns(2)
+                entregado = g1.number_input(
+                    "Monto entregado (S/)", value=float(precio),
+                    min_value=0.0, max_value=float(precio), step=10.0,
+                    help="Cuanto paga ahora. Dejalo igual al precio si paga todo.")
+                saldo = max(0.0, precio - entregado)
+                pagado = saldo <= 0
+
+                if saldo > 0:
+                    limite = g2.date_input(
+                        "Pagar el saldo hasta", value=logic.hoy() + timedelta(days=15),
+                        min_value=logic.hoy(), format="DD/MM/YYYY",
+                        help="Plazo acordado con el cliente")
+                    g2.caption(f"Queda debiendo **S/ {saldo:,.2f}**")
+                else:
+                    limite = None
+                    g2.caption("Pago completo, sin saldo pendiente.")
+
+                f1, f2 = st.columns(2)
                 es_renovacion = bool(vigente) or bool(db.ultimo_paquete(alumno_id))
                 tipo = f1.selectbox("Renovacion o nuevo", ["NUEVO", "RENOVACION"],
                                     index=1 if es_renovacion else 0)
@@ -1015,7 +1249,6 @@ def pagina_paquetes() -> None:
                     vendedor = "Otro..."
                 if vendedor == "Otro...":
                     vendedor = f2.text_input("Nombre del vendedor", key="vend_nuevo")
-                pagado = f3.selectbox("Estado del pago", ["Pagado", "Pendiente"]) == "Pagado"
 
                 obs = st.text_input("Observacion", placeholder="Opcional")
 
@@ -1041,16 +1274,23 @@ def pagina_paquetes() -> None:
                 if cronograma:
                     st.info(
                         f"**{sesiones} sesiones** entrenando "
-                        f"{logic.frecuencia(dias_grupo)}. Primera el "
-                        f"{fecha_larga(cronograma[0])}, ultima el "
+                        f"{logic.frecuencia(dias_grupo)} ({dias_grupo}). "
+                        f"Primera el {fecha_larga(cronograma[0])}, ultima el "
                         f"**{fecha_larga(fin)}**."
                     )
+                    if len(cronograma) <= 12:
+                        st.caption("Fechas: " + " · ".join(
+                            f.strftime("%d/%m") for f in cronograma))
                 else:
                     st.info(f"**{sesiones} sesiones** del "
                             f"{inicio.strftime('%d/%m/%Y')} al "
                             f"**{fin.strftime('%d/%m/%Y')}**.")
 
                 if st.form_submit_button("Registrar pedido", type="primary"):
+                    if not dias_grupo:
+                        st.error("Marca al menos un dia de entrenamiento antes de "
+                                 "registrar el pedido.")
+                        st.stop()
                     medio_completo = f"{medio} {recibido}".strip() if recibido else medio
                     try:
                         db.crear_paquete(
@@ -1059,10 +1299,16 @@ def pagina_paquetes() -> None:
                             dias_asiste=dias_grupo,
                             vendedor=(vendedor or "").strip().upper() or None,
                             tipo=tipo, sesiones=int(sesiones), vigencia_dias=int(vigencia),
-                            grupo_id=grupo_id)
+                            grupo_id=grupo_id, precio_lista=precio_lista,
+                            monto_entregado=entregado, fecha_limite_pago=limite)
                         st.toast(f"Pedido {pedido} registrado", icon="\u2705")
-                        st.success(f"Pedido N {pedido} registrado. "
-                                   f"Vence el {fin.strftime('%d/%m/%Y')}.")
+                        aviso_pedido = (f"Pedido N {pedido} registrado. "
+                                        f"Vence el {fin.strftime('%d/%m/%Y')}.")
+                        if saldo > 0:
+                            aviso_pedido += (f" Queda un saldo de S/ {saldo:,.2f} "
+                                             f"con plazo hasta el "
+                                             f"{limite.strftime('%d/%m/%Y')}.")
+                        st.success(aviso_pedido)
                         st.rerun()
                     except Exception as e:
                         st.error(f"No se pudo registrar: {e}")
@@ -1076,11 +1322,13 @@ def pagina_paquetes() -> None:
             theme.vacio("Sin paquetes que mostrar",
                         "Cambia los filtros o registra el primer pedido.")
             return
-        columnas = ["nro_pedido", "fecha_pedido", "alumno", "plan_nombre", "precio",
+        columnas = ["nro_pedido", "fecha_pedido", "alumno", "plan_nombre",
+                    "precio_lista", "precio", "descuento", "descuento_pct",
                     "medio_pago", "fecha_inicio", "fecha_fin", "sede", "dias_asiste",
                     "sesiones_usadas", "sesiones_totales", "sesiones_restantes",
                     "dias_restantes", "dias_congelados", "estado_real", "tipo",
-                    "vendedor", "pagado"]
+                    "vendedor", "monto_entregado", "saldo", "fecha_limite_pago",
+                    "estado_pago"]
         # Si la migracion 006 aun no se corrio faltan columnas: avisar sin romper
         faltan = [c for c in columnas if c not in datos.columns]
         for c in faltan:
@@ -1090,18 +1338,22 @@ def pagina_paquetes() -> None:
                        "Supabase para tener numero de pedido, sede y vendedor.")
 
         vista = datos[columnas].copy()
-        vista.columns = ["N pedido", "Fecha", "Cliente", "Plan contratado", "Monto total",
+        vista.columns = ["N pedido", "Fecha", "Cliente", "Plan contratado",
+                         "Precio lista", "Precio cobrado", "Descuento", "Dcto %",
                          "Metodo de pago", "Inicio del plan", "Fin del plan",
                          "Sede y turno", "Dias que asiste", "Usadas", "Totales",
                          "Restantes", "Dias por vencer", "Dias congelados", "Status",
-                         "Renovacion/Nuevo", "Vendedor", "Pagado"]
+                         "Renovacion/Nuevo", "Vendedor", "Entregado", "Saldo",
+                         "Plazo de pago", "Estado del pago"]
         vista["Avance"] = (vista["Usadas"] / vista["Totales"].replace(0, 1) * 100)
-        vista = vista[["N pedido", "Fecha", "Cliente", "Plan contratado", "Monto total",
-                       "Metodo de pago", "Inicio del plan", "Fin del plan", "Sede y turno",
-                       "Dias que asiste", "Avance", "Restantes", "Dias por vencer",
-                       "Dias congelados", "Status", "Renovacion/Nuevo", "Vendedor",
-                       "Pagado"]]
-        for col in ("Fecha", "Inicio del plan", "Fin del plan"):
+        vista = vista[["N pedido", "Fecha", "Cliente", "Plan contratado",
+                       "Precio lista", "Precio cobrado", "Descuento", "Dcto %",
+                       "Metodo de pago", "Inicio del plan", "Fin del plan",
+                       "Sede y turno", "Dias que asiste", "Avance", "Restantes",
+                       "Dias por vencer", "Dias congelados", "Status",
+                       "Renovacion/Nuevo", "Vendedor", "Entregado", "Saldo",
+                       "Plazo de pago", "Estado del pago"]]
+        for col in ("Fecha", "Inicio del plan", "Fin del plan", "Plazo de pago"):
             vista[col] = pd.to_datetime(vista[col], errors="coerce")
 
         st.dataframe(
@@ -1110,17 +1362,29 @@ def pagina_paquetes() -> None:
                 "N pedido": st.column_config.NumberColumn("N pedido", format="%d"),
                 "Avance": st.column_config.ProgressColumn(
                     "Avance", min_value=0, max_value=100, format="%d%%"),
-                "Monto total": st.column_config.NumberColumn(
-                    "Monto total", format="S/ %.2f"),
+                "Precio lista": st.column_config.NumberColumn(
+                    "Precio lista", format="S/ %.2f"),
+                "Precio cobrado": st.column_config.NumberColumn(
+                    "Precio cobrado", format="S/ %.2f"),
+                "Descuento": st.column_config.NumberColumn(
+                    "Descuento", format="S/ %.2f",
+                    help="Cuanto se dejo de cobrar respecto al precio de lista"),
+                "Dcto %": st.column_config.NumberColumn("Dcto %", format="%.1f%%"),
                 "Fecha": st.column_config.DateColumn("Fecha", format="DD/MM/YYYY"),
                 "Inicio del plan": st.column_config.DateColumn(
                     "Inicio del plan", format="DD/MM/YYYY"),
                 "Fin del plan": st.column_config.DateColumn(
                     "Fin del plan", format="DD/MM/YYYY"),
-                "Pagado": st.column_config.CheckboxColumn("Pagado"),
+                "Entregado": st.column_config.NumberColumn(
+                    "Entregado", format="S/ %.2f"),
+                "Saldo": st.column_config.NumberColumn(
+                    "Saldo", format="S/ %.2f",
+                    help="Lo que todavia falta cobrar"),
+                "Plazo de pago": st.column_config.DateColumn(
+                    "Plazo de pago", format="DD/MM/YYYY"),
             })
-        st.download_button("Descargar CSV", vista.to_csv(index=False).encode("utf-8"),
-                           "futcross_paquetes.csv", "text/csv")
+        descargar_csv("Descargar CSV", vista, "futcross_paquetes.csv",
+                      clave="csv_paquetes")
 
 
 # =====================================================================
@@ -1261,9 +1525,7 @@ def pagina_renovaciones() -> None:
         st.info("Sin alumnos registrados.")
         return
 
-    alertas = alumnos.apply(lambda f: logic.alerta_renovacion(f.to_dict()), axis=1)
-    alumnos["nivel"] = [a[0] for a in alertas]
-    alumnos["motivo"] = [a[1] for a in alertas]
+    alumnos = con_alertas(alumnos)
 
     orden = {"VENCIDO": 0, "URGENTE": 1, "PROXIMO": 2, "OK": 3}
     alumnos["orden"] = alumnos["nivel"].map(orden)
@@ -1301,9 +1563,10 @@ def pagina_renovaciones() -> None:
             c1.markdown(
                 f'<div style="display:flex;gap:.7rem;align-items:center">'
                 f'{theme.avatar(f["alumno"])}'
-                f'<div><b>{f["alumno"]}</b><br>'
+                f'<div><b>{esc(f["alumno"])}</b><br>'
                 f'<span style="font-size:.78rem;color:{theme.HUMO}">'
-                f'{f.get("plan_nombre") or "Sin plan"} &middot; {f["motivo"]}</span></div></div>'
+                f'{esc(f.get("plan_nombre") or "Sin plan")} &middot; '
+                f'{esc(f["motivo"])}</span></div></div>'
                 + (theme.barra(usadas, totales) if totales else ""),
                 unsafe_allow_html=True)
             c2.markdown(theme.chip(f["estado_real"]), unsafe_allow_html=True)
@@ -1320,9 +1583,7 @@ def pagina_renovaciones() -> None:
 
     vista = datos[["codigo", "alumno", "telefono", "plan_nombre", "sesiones_restantes",
                    "fecha_fin", "estado_real", "nivel", "motivo"]]
-    st.download_button("Descargar lista de llamadas",
-                       vista.to_csv(index=False).encode("utf-8"),
-                       "futcross_renovaciones.csv", "text/csv")
+    descargar_csv("Descargar lista de llamadas", vista, "futcross_renovaciones.csv")
 
 
 # =====================================================================
@@ -1340,24 +1601,44 @@ def pagina_reportes() -> None:
         return
 
     asis = db.asistencias(desde, hasta)
-    paquetes = db.listar_paquetes()
 
-    if not paquetes.empty:
-        paquetes["fecha_inicio_d"] = paquetes["fecha_inicio"].map(logic.a_fecha)
-        vendidos = paquetes[(paquetes["fecha_inicio_d"] >= desde) &
-                            (paquetes["fecha_inicio_d"] <= hasta) &
-                            (paquetes["estado_real"] != "CANCELADO")]
-    else:
-        vendidos = pd.DataFrame()
+    # El rango lo filtra Postgres. Antes se bajaba el historico completo de
+    # pedidos de la academia para quedarse con los de un mes.
+    vendidos = db.listar_paquetes(desde=desde, hasta=hasta)
+    if not vendidos.empty:
+        vendidos = vendidos[vendidos["estado_real"] != "CANCELADO"]
 
     dias_rango = (hasta - desde).days + 1
+
+    # Cuanto se dejo de cobrar por descuentos en el rango
+    if not vendidos.empty and "precio_lista" in vendidos.columns:
+        lista_total = float(vendidos["precio_lista"].fillna(
+            vendidos["precio"]).sum())
+        cobrado_total = float(vendidos["precio"].sum())
+        descuento_total = lista_total - cobrado_total
+        pct_dcto = descuento_total / lista_total * 100 if lista_total else 0
+    else:
+        cobrado_total = float(vendidos["precio"].sum()) if not vendidos.empty else 0.0
+        descuento_total, pct_dcto = 0.0, 0.0
+
+    # Vendido no es lo mismo que cobrado: con pagos parciales, parte de lo
+    # vendido todavia esta en la calle.
+    if not vendidos.empty and "monto_entregado" in vendidos.columns:
+        entrado = float(vendidos["monto_entregado"].fillna(0).sum())
+        por_cobrar = max(0.0, cobrado_total - entrado)
+    else:
+        entrado, por_cobrar = cobrado_total, 0.0
+
     theme.kpis([
         ("Asistencias", len(asis), f"en {dias_rango} dias", "naranja"),
-        ("Alumnos distintos", asis["alumno_id"].nunique() if not asis.empty else 0,
-         "vinieron al menos una vez"),
         ("Paquetes vendidos", len(vendidos), "en el rango elegido"),
-        ("Ingresos", f"S/ {vendidos['precio'].sum():,.0f}" if not vendidos.empty else "S/ 0",
-         "cobrado en el rango", "verde"),
+        ("Vendido", f"S/ {cobrado_total:,.0f}", "valor de los pedidos"),
+        ("Cobrado", f"S/ {entrado:,.0f}", "entro a caja de verdad", "verde"),
+        ("Por cobrar", f"S/ {por_cobrar:,.0f}", "saldos pendientes",
+         "rojo" if por_cobrar else "verde"),
+        ("Descuentos", f"S/ {descuento_total:,.0f}",
+         f"{pct_dcto:.1f}% del precio de lista",
+         "ambar" if descuento_total else "neutro"),
     ])
 
     st.divider()
@@ -1388,17 +1669,46 @@ def pagina_reportes() -> None:
         detalle = asis[["fecha", "hora", "codigo", "alumno", "origen"]].copy()
         detalle.columns = ["Fecha", "Hora", "Codigo", "Alumno", "Origen"]
         st.dataframe(detalle, width="stretch", hide_index=True, height=320)
-        st.download_button("Descargar asistencias",
-                           detalle.to_csv(index=False).encode("utf-8"),
-                           f"futcross_asistencias_{desde}_{hasta}.csv", "text/csv")
+        descargar_csv("Descargar asistencias", detalle,
+                      f"futcross_asistencias_{desde}_{hasta}.csv")
 
     if not vendidos.empty:
         st.divider()
-        st.subheader("Ventas por plan")
-        ventas = (vendidos.groupby("plan_nombre")
-                  .agg(Paquetes=("id", "count"), Ingresos=("precio", "sum"))
-                  .sort_values("Ingresos", ascending=False))
-        st.dataframe(ventas, width="stretch")
+        theme.seccion("Ventas por plan", "cuanto se cobro y cuanto se descontó")
+        agrupado = vendidos.copy()
+        if "precio_lista" not in agrupado.columns:
+            agrupado["precio_lista"] = agrupado["precio"]
+        agrupado["precio_lista"] = agrupado["precio_lista"].fillna(agrupado["precio"])
+        agrupado["dcto"] = agrupado["precio_lista"] - agrupado["precio"]
+
+        ventas = (agrupado.groupby("plan_nombre")
+                  .agg(Paquetes=("id", "count"),
+                       Lista=("precio_lista", "sum"),
+                       Cobrado=("precio", "sum"),
+                       Descuento=("dcto", "sum"))
+                  .sort_values("Cobrado", ascending=False))
+        st.dataframe(
+            ventas, width="stretch",
+            column_config={
+                "Lista": st.column_config.NumberColumn("Precio lista", format="S/ %.2f"),
+                "Cobrado": st.column_config.NumberColumn("Cobrado", format="S/ %.2f"),
+                "Descuento": st.column_config.NumberColumn("Descuento", format="S/ %.2f"),
+            })
+
+        if "vendedor" in agrupado.columns and agrupado["vendedor"].notna().any():
+            theme.seccion("Descuentos por vendedor", "quien esta bajando mas el precio")
+            por_vend = (agrupado.dropna(subset=["vendedor"])
+                        .groupby("vendedor")
+                        .agg(Ventas=("id", "count"),
+                             Cobrado=("precio", "sum"),
+                             Descuento=("dcto", "sum"))
+                        .sort_values("Descuento", ascending=False))
+            st.dataframe(
+                por_vend, width="stretch",
+                column_config={
+                    "Cobrado": st.column_config.NumberColumn("Cobrado", format="S/ %.2f"),
+                    "Descuento": st.column_config.NumberColumn("Descuento", format="S/ %.2f"),
+                })
 
 
 # =====================================================================
@@ -1544,6 +1854,83 @@ def pagina_planes() -> None:
 
 
 # =====================================================================
+# 9. ACCESOS
+# =====================================================================
+def pagina_accesos() -> None:
+    theme.cabecera("Accesos", fecha_larga(logic.hoy()).upper(), "Claves del equipo")
+    st.caption(
+        "Hay una sola direccion para todo el equipo: la clave que escriben "
+        "decide que ven. La de administracion abre las nueve pantallas; la de "
+        "entrenador solo Panel, Marcar asistencia, Alumnos y Renovaciones."
+    )
+
+    origen_admin = db.leer_config("pin_admin")
+    origen_prof = db.leer_config("pin_entrenador")
+
+    theme.seccion("Situacion actual", "")
+    c1, c2 = st.columns(2)
+    for col, etiqueta, guardado, clave in [
+        (c1, "Administracion", origen_admin, "pin_admin"),
+        (c2, "Entrenador", origen_prof, "pin_entrenador"),
+    ]:
+        with col:
+            if guardado:
+                info = db.config_actualizada(clave) or {}
+                cuando = str(info.get("actualizado_en") or "")[:10]
+                col.success(f"**{etiqueta}**: clave propia"
+                            + (f", cambiada el {cuando}" if cuando else ""))
+            else:
+                col.warning(f"**{etiqueta}**: usando la clave de los secretos "
+                            "del servidor. Cambiala aca para poder administrarla "
+                            "desde el panel.")
+
+    theme.seccion("Cambiar una clave", "hay que escribir la clave de administracion actual")
+    with st.form("form_pin", clear_on_submit=True):
+        cual = st.radio("Que clave cambio",
+                        ["Entrenador", "Administracion"], horizontal=True)
+        actual = st.text_input("Clave de administracion actual", type="password")
+        c3, c4 = st.columns(2)
+        nueva = c3.text_input("Clave nueva", type="password")
+        repetida = c4.text_input("Repite la clave nueva", type="password")
+
+        if st.form_submit_button("Guardar clave", type="primary"):
+            rol_pin = "admin" if cual == "Administracion" else "entrenador"
+
+            if not comparar_pin(actual, pin_guardado("admin")):
+                registrar_fallo()
+                st.error("La clave de administracion actual no es correcta.")
+            else:
+                problema = acceso.validar_pin_nuevo(nueva, repetida)
+                if problema:
+                    st.error(problema)
+                elif rol_pin == "entrenador" and comparar_pin(
+                        nueva, pin_guardado("admin")):
+                    st.error("La clave de entrenador no puede ser igual a la de "
+                             "administracion: le daria acceso a todo.")
+                else:
+                    try:
+                        db.guardar_config(CLAVES_PIN[rol_pin],
+                                          acceso.hashear_pin(nueva),
+                                          quien=ETIQUETA_ROL.get(rol(), ""))
+                        st.toast("Clave actualizada", icon="\u2705")
+                        st.success(
+                            f"Clave de {cual.lower()} actualizada. "
+                            + ("Vas a tener que volver a entrar con la nueva."
+                               if rol_pin == "admin" else
+                               "Pasasela a los entrenadores; la anterior ya no sirve.")
+                        )
+                    except Exception as e:
+                        st.error(f"No se pudo guardar: {e}")
+
+    st.caption(
+        "Las claves se guardan cifradas: ni yo ni nadie con acceso a la base "
+        "puede leerlas. Si se olvida la de administracion, se recupera "
+        "borrando la fila `pin_admin` de la tabla `config` en Supabase, y "
+        "vuelve a valer la de los secretos del servidor."
+    )
+
+
+# =====================================================================
 # NAVEGACION
 # =====================================================================
 PAGINAS_ADMIN = {
@@ -1555,12 +1942,13 @@ PAGINAS_ADMIN = {
     "Congelamientos": pagina_congelamientos,
     "Reportes": pagina_reportes,
     "Planes": pagina_planes,
+    "Accesos": pagina_accesos,
 }
 
 GRUPOS = [
     ("Dia a dia", ["Panel", "Marcar asistencia", "Renovaciones"]),
     ("Alumnos y pagos", ["Alumnos", "Paquetes", "Congelamientos"]),
-    ("Gestion", ["Reportes", "Planes"]),
+    ("Gestion", ["Reportes", "Planes", "Accesos"]),
 ]
 
 
@@ -1641,7 +2029,14 @@ def main() -> None:
     st.session_state.setdefault("kiosco", None)
     st.session_state.setdefault("rol", None)
 
+    if hay_sesion() and sesion_expirada():
+        st.session_state.pop("rol", None)
+        st.session_state.pop("ultimo_uso", None)
+        st.session_state["expirada"] = True
+
     if not hay_sesion():
+        if st.session_state.pop("expirada", False):
+            st.info("La sesion se cerro sola por inactividad. Vuelve a ingresar el PIN.")
         pantalla_login()
         return
 
