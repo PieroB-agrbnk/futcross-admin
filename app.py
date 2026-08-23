@@ -19,6 +19,7 @@ st.set_page_config(
 
 import acceso      # noqa: E402
 import db          # noqa: E402
+import importar    # noqa: E402
 import logic       # noqa: E402
 import theme       # noqa: E402
 
@@ -26,7 +27,7 @@ theme.aplicar_estilos()
 
 # Se muestra en la barra lateral. Sirve para saber de un vistazo si la version
 # que estas viendo en la nube es la misma que tienes en tu computadora.
-VERSION = "3.0"
+VERSION = "3.2"
 
 DIAS_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
 TURNOS = ["MANANA", "TARDE", "NOCHE"]
@@ -153,7 +154,7 @@ def con_alertas(alumnos: pd.DataFrame) -> pd.DataFrame:
 PERMISOS = {
     "admin": ["Panel", "Marcar asistencia", "Renovaciones", "Alumnos",
               "Paquetes", "Congelamientos", "Reportes", "Planes",
-              "Dias sin entrenar", "Accesos"],
+              "Dias sin entrenar", "Carga masiva", "Accesos"],
     "entrenador": ["Panel", "Marcar asistencia", "Alumnos", "Renovaciones"],
 }
 
@@ -1096,19 +1097,178 @@ def ficha_alumno(alumno_id: str) -> None:
 # =====================================================================
 # 4. PAQUETES
 # =====================================================================
+def editar_pedido(planes) -> None:
+    """Corrige un pedido ya registrado.
+
+    El caso que lo motivo: el alumno confirma que arranca el lunes y el
+    domingo avisa que mejor el miercoles. Antes habia que anular el
+    pedido y cargarlo de nuevo, perdiendo el numero y la fecha de venta.
+    """
+    pedidos = db.listar_paquetes()
+    if pedidos.empty:
+        theme.vacio("Sin pedidos", "Registra el primero en la otra pestana.")
+        return
+
+    def etiqueta(r):
+        inicio = logic.a_fecha(r["fecha_inicio"])
+        return (f"N {r.get('nro_pedido') or '-'} · {r['alumno']} · "
+                f"{r['plan_nombre']} · desde {inicio.strftime('%d/%m/%Y')}")
+
+    opciones = {etiqueta(r): r["id"] for _, r in pedidos.iterrows()}
+    elegido = st.selectbox("Pedido a corregir", list(opciones.keys()),
+                           key="pedido_editar")
+    pq = db.paquete(opciones[elegido])
+    if not pq:
+        st.error("No se encontro el pedido.")
+        return
+
+    usadas = int(pq.get("sesiones_usadas") or 0)
+    asistencias = int(pq.get("asistencias_registradas") or 0)
+    empezado = usadas > 0 or asistencias > 0
+
+    if empezado:
+        st.warning(
+            f"Este plan ya empezo: lleva {usadas} sesiones corridas y "
+            f"{asistencias} asistencias registradas. Si mueves la fecha de "
+            "inicio, esas cuentas cambian. Corrigelo solo si de verdad "
+            "arranco otro dia."
+        )
+    else:
+        st.info("Este plan todavia no arranca, se puede mover sin problema.")
+
+    with st.form("form_editar_pedido"):
+        c1, c2, c3 = st.columns([2, 1, 1])
+        nombres_planes = planes["nombre"].tolist()
+        actual = pq.get("plan_nombre")
+        indice = nombres_planes.index(actual) if actual in nombres_planes else 0
+        nombre_plan = c1.selectbox("Plan contratado", nombres_planes, index=indice)
+        plan = planes[planes["nombre"] == nombre_plan].iloc[0].to_dict()
+
+        fecha_pedido = c2.date_input(
+            "Fecha del pedido", value=logic.a_fecha(pq.get("fecha_pedido")),
+            format="DD/MM/YYYY", help="Cuando se cerro la venta. No suele cambiar.")
+        inicio = c3.date_input(
+            "Inicio del plan", value=logic.a_fecha(pq["fecha_inicio"]),
+            format="DD/MM/YYYY",
+            help="Al cambiarla se recalculan todas las fechas del alumno")
+
+        st.markdown("**Grupo y dias que entrena**")
+        grupo_id, dias_grupo, detalle = selector_de_grupo(
+            "Sede, horario y genero", clave="grupo_edicion",
+            grupo_actual=pq.get("grupo_id"),
+            dias_previos=str(pq.get("dias_asiste") or ""))
+        if detalle:
+            st.caption(detalle)
+
+        a1, a2 = st.columns(2)
+        sesiones = a1.number_input("Sesiones", min_value=1,
+                                   value=int(pq["sesiones_totales"]))
+        tipo = a2.selectbox("Renovacion o nuevo", ["NUEVO", "RENOVACION"],
+                            index=1 if pq.get("tipo") == "RENOVACION" else 0)
+
+        fin = logic.fecha_fin_por_calendario(
+            inicio, int(sesiones), dias_grupo, int(plan["vigencia_dias"]))
+
+        st.markdown("**Cobro**")
+        e1, e2, e3 = st.columns(3)
+        precio_lista = e1.number_input(
+            "Precio de lista (S/)", min_value=0.0, step=10.0,
+            value=float(pq.get("precio_lista") or pq.get("precio") or 0))
+        precio = e2.number_input("Precio cobrado (S/)", min_value=0.0, step=1.0,
+                                 value=float(pq.get("precio") or 0))
+        entregado = e3.number_input(
+            "Monto entregado (S/)", min_value=0.0, step=10.0,
+            value=float(pq.get("monto_entregado") or 0))
+
+        saldo = max(0.0, precio - entregado)
+        f1, f2 = st.columns(2)
+        if saldo > 0:
+            limite = f1.date_input(
+                "Pagar el saldo hasta",
+                value=logic.a_fecha(pq.get("fecha_limite_pago"))
+                or logic.hoy() + timedelta(days=15), format="DD/MM/YYYY")
+            f1.caption(f"Queda debiendo **S/ {saldo:,.2f}**")
+        else:
+            limite = None
+            f1.caption("Sin saldo pendiente.")
+        medio = f2.selectbox(
+            "Metodo de pago", MEDIOS_PAGO,
+            index=next((i for i, m in enumerate(MEDIOS_PAGO)
+                        if str(pq.get("medio_pago") or "").upper().startswith(m)), 0))
+
+        vendedor = st.text_input("Vendedor", value=str(pq.get("vendedor") or ""))
+        obs = st.text_input("Observacion", value=str(pq.get("observacion") or ""))
+
+        cronograma = logic.proximas_sesiones(inicio, int(sesiones), dias_grupo)
+        if cronograma:
+            st.info(
+                f"**{sesiones} sesiones** entrenando "
+                f"{logic.frecuencia(dias_grupo)} ({dias_grupo}). "
+                f"Primera el {fecha_larga(cronograma[0])}, ultima el "
+                f"**{fecha_larga(fin)}**."
+            )
+            anterior_fin = logic.a_fecha(pq["fecha_fin"])
+            if anterior_fin and anterior_fin != fin:
+                st.warning(f"La ultima sesion se mueve del "
+                           f"{anterior_fin.strftime('%d/%m/%Y')} al "
+                           f"{fin.strftime('%d/%m/%Y')}.")
+            if len(cronograma) <= 12:
+                st.caption("Fechas: " + " · ".join(
+                    f.strftime("%d/%m") for f in cronograma))
+
+        confirmar = st.checkbox(
+            "Confirmo el cambio", value=not empezado,
+            help="Si el plan ya empezo, revisa bien antes de guardar")
+
+        if st.form_submit_button("Guardar cambios", type="primary"):
+            if not dias_grupo:
+                st.error("Marca al menos un dia de entrenamiento.")
+            elif not confirmar:
+                st.error("Marca la casilla de confirmacion.")
+            elif entregado > precio:
+                st.error("El monto entregado no puede ser mayor al cobrado.")
+            else:
+                try:
+                    db.editar_pedido(
+                        pq["id"], plan, inicio, int(sesiones), dias_grupo,
+                        grupo_id, precio_lista, precio, entregado, limite,
+                        (vendedor or "").strip().upper() or None, tipo, medio,
+                        fecha_pedido, obs or None,
+                        quien=ETIQUETA_ROL.get(rol(), ""))
+                    st.toast("Pedido corregido", icon="\u2705")
+                    st.success(
+                        f"Pedido actualizado. Su ultima sesion queda el "
+                        f"{fecha_larga(fin)}."
+                    )
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"No se pudo guardar: {e}")
+
+    st.caption(
+        "El numero de pedido no cambia. Cada correccion queda registrada y se "
+        "puede ver en el Panel, en Intentos rechazados."
+    )
+
+
 def pagina_paquetes() -> None:
     theme.cabecera("Paquetes", fecha_larga(logic.hoy()).upper(), "Ventas y renovaciones")
 
     planes = db.listar_planes()
-    tab_vender, tab_lista = st.tabs(["Vender o renovar", "Todos los paquetes"])
+    tab_vender, tab_editar, tab_lista = st.tabs(
+        ["Vender o renovar", "Editar un pedido", "Todos los paquetes"])
 
     if planes.empty:
         with tab_vender:
             theme.vacio("No hay planes activos",
                         "Crea al menos un plan en la pantalla Planes.")
+        with tab_editar:
+            theme.vacio("Nada que editar", "Primero crea un plan.")
         with tab_lista:
             theme.vacio("Sin pedidos", "Todavia no se registro ninguno.")
         return
+
+    with tab_editar:
+        editar_pedido(planes)
 
     with tab_vender:
         alumnos = db.panel_alumnos()
@@ -1859,7 +2019,145 @@ def pagina_planes() -> None:
 
 
 # =====================================================================
-# 9. DIAS SIN ENTRENAMIENTO
+# 9. CARGA MASIVA
+# =====================================================================
+def pagina_carga_masiva() -> None:
+    theme.cabecera("Carga masiva", fecha_larga(logic.hoy()).upper(),
+                   "Cargar el padron desde Excel")
+    st.caption(
+        "Sirve para cargar de golpe a los alumnos que ya tienen. El sistema "
+        "revisa el archivo entero y muestra fila por fila que esta bien y que "
+        "no; recien cuando todo esta limpio se importa. Nunca se guarda una "
+        "carga a medias."
+    )
+
+    grupos = db.listar_grupos().to_dict("records")
+    planes = db.listar_planes().to_dict("records")
+
+    theme.seccion("1. Descarga la plantilla", "llenala en Excel y vuelve aca")
+    c1, c2 = st.columns([1, 2])
+    c1.download_button("Descargar plantilla",
+                       importar.plantilla_csv().encode("utf-8-sig"),
+                       "futcross_plantilla.csv", "text/csv", type="primary")
+    with c2:
+        st.caption(
+            "Solo son obligatorios **nombres**, **apellidos** y **plan**. "
+            "Si dejas los dias en blanco, se toman los del grupo; si dejas los "
+            "precios, se toma el del plan. La fecha va como 11/08/2026."
+        )
+        if grupos:
+            st.caption("Grupos que puedes usar: " + ", ".join(
+                f"**{g['sede']}**" for g in grupos))
+        if planes:
+            st.caption("Planes: " + ", ".join(f"**{p['nombre']}**" for p in planes))
+
+    theme.seccion("2. Sube el archivo lleno", "acepta Excel y CSV")
+    archivo = st.file_uploader("Archivo", type=["csv", "xlsx", "xls"],
+                               label_visibility="collapsed")
+    if not archivo:
+        return
+
+    try:
+        if archivo.name.lower().endswith(".csv"):
+            crudo = pd.read_csv(archivo, sep=None, engine="python",
+                                dtype=str, keep_default_na=False)
+        else:
+            crudo = pd.read_excel(archivo, dtype=str)
+    except ImportError:
+        st.error("Para leer Excel falta la libreria openpyxl. Guarda el archivo "
+                 "como CSV desde Excel (Archivo > Guardar como > CSV) y subelo.")
+        return
+    except Exception as e:
+        st.error(f"No se pudo leer el archivo: {e}")
+        return
+
+    crudo.columns = [str(c).strip().lower().replace(" ", "_") for c in crudo.columns]
+    faltan = [c for c in importar.OBLIGATORIAS if c not in crudo.columns]
+    if faltan:
+        st.error(f"Al archivo le faltan columnas: {', '.join(faltan)}. "
+                 "Descarga la plantilla y usa esas cabeceras.")
+        return
+
+    for col in importar.COLUMNAS:
+        if col not in crudo.columns:
+            crudo[col] = ""
+    crudo = crudo[[c for c in importar.COLUMNAS]]
+    crudo = crudo[crudo.apply(
+        lambda f: any(str(v).strip() for v in f), axis=1)]
+
+    if crudo.empty:
+        theme.vacio("El archivo esta vacio", "Llena al menos una fila.")
+        return
+
+    try:
+        existentes = db.dnis_registrados()
+    except Exception:
+        existentes = {}
+
+    validadas = importar.validar(crudo.to_dict("records"), grupos, planes, existentes)
+    res = importar.resumen(validadas)
+
+    theme.seccion("3. Revisa antes de guardar", f"{res['total']} filas leidas")
+    theme.kpis([
+        ("Alumnos nuevos", res["nuevos"], "se van a crear", "verde"),
+        ("Ya existen", res["existentes"], "se les agrega el plan"),
+        ("Con problemas", res["errores"], "hay que corregirlos",
+         "rojo" if res["errores"] else "verde"),
+    ])
+
+    vista = pd.DataFrame(importar.para_mostrar(validadas))
+    st.dataframe(vista, width="stretch", hide_index=True, height=380,
+                 column_config={
+                     "Cobrado": st.column_config.NumberColumn(
+                         "Cobrado", format="S/ %.2f"),
+                     "Entregado": st.column_config.NumberColumn(
+                         "Entregado", format="S/ %.2f"),
+                 })
+
+    if res["errores"]:
+        st.error(
+            f"Hay {res['errores']} filas con problemas. Corrigelas en el Excel "
+            "y vuelve a subirlo: no se importa nada hasta que todo este limpio. "
+            "La columna Problema dice que le pasa a cada una."
+        )
+        descargar_csv("Descargar las observaciones",
+                      vista[vista["Estado"] == "Revisar"],
+                      "futcross_filas_con_problema.csv", clave="csv_errores")
+        return
+
+    st.success(
+        f"Todo listo: {res['nuevos']} alumnos nuevos y "
+        f"{res['existentes']} que ya estaban. "
+        "Cada uno queda con su plan y su fecha de vencimiento calculada."
+    )
+    confirmar = st.checkbox("Confirmo que revise la lista y esta correcta")
+    if st.button("Importar ahora", type="primary", disabled=not confirmar,
+                 width="stretch"):
+        barra = st.progress(0.0, "Importando...")
+        creados, fallidas = 0, []
+        for i, fila in enumerate(validadas, start=1):
+            try:
+                db.importar_fila(fila)
+                creados += 1
+            except Exception as e:
+                fallidas.append((fila["_fila"], str(e)[:120]))
+            barra.progress(i / len(validadas), f"Importando {i} de {len(validadas)}")
+        barra.empty()
+
+        if fallidas:
+            st.error(f"Se importaron {creados} de {len(validadas)}. "
+                     "Estas filas fallaron:")
+            for numero, motivo in fallidas:
+                st.write(f"- Fila {numero}: {motivo}")
+            st.caption("Las que fallaron NO quedaron a medias. Corrigelas y "
+                       "vuelve a subir solo esas: las que ya estan no se duplican.")
+        else:
+            st.toast(f"{creados} alumnos importados", icon="\u2705")
+            st.success(f"Listos los {creados}. Revisalos en la pantalla Alumnos.")
+
+
+# =====================================================================
+# 10. DIAS SIN ENTRENAMIENTO
 # =====================================================================
 def pagina_dias_libres() -> None:
     theme.cabecera("Dias sin entrenamiento", fecha_larga(logic.hoy()).upper(),
@@ -1924,7 +2222,7 @@ def pagina_dias_libres() -> None:
 
 
 # =====================================================================
-# 10. ACCESOS
+# 11. ACCESOS
 # =====================================================================
 def pagina_accesos() -> None:
     theme.cabecera("Accesos", fecha_larga(logic.hoy()).upper(), "Claves del equipo")
@@ -2013,13 +2311,15 @@ PAGINAS_ADMIN = {
     "Reportes": pagina_reportes,
     "Planes": pagina_planes,
     "Dias sin entrenar": pagina_dias_libres,
+    "Carga masiva": pagina_carga_masiva,
     "Accesos": pagina_accesos,
 }
 
 GRUPOS = [
     ("Dia a dia", ["Panel", "Marcar asistencia", "Renovaciones"]),
     ("Alumnos y pagos", ["Alumnos", "Paquetes", "Congelamientos"]),
-    ("Gestion", ["Reportes", "Planes", "Dias sin entrenar", "Accesos"]),
+    ("Gestion", ["Reportes", "Planes", "Dias sin entrenar",
+                 "Carga masiva", "Accesos"]),
 ]
 
 

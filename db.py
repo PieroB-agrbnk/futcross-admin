@@ -272,6 +272,55 @@ def panel_alumnos(solo_activos: bool = True) -> pd.DataFrame:
     return _df(q.execute().data)
 
 
+@_cache(CACHE_CORTO)
+def dnis_registrados() -> dict:
+    """{dni: alumno_id} de todo el padron.
+
+    Lo usa la carga masiva para no duplicar a quien ya esta: si el DNI
+    existe, se le agrega el pedido al alumno que ya hay.
+    """
+    rows = (_tabla("alumnos").select("id,dni").limit(5000).execute().data) or []
+    return {r["dni"]: r["id"] for r in rows if r.get("dni")}
+
+
+def importar_fila(fila: dict) -> str:
+    """Crea (o reutiliza) el alumno y le registra su pedido.
+
+    Devuelve el codigo del alumno. Se llama una fila a la vez para que,
+    si algo falla a mitad, se sepa exactamente donde quedo.
+    """
+    alumno_id = fila.get("_alumno_existente")
+    grupo = fila.get("_grupo") or {}
+
+    if not alumno_id:
+        creado = _tabla("alumnos").insert({
+            "nombres": fila["nombres"].strip().title(),
+            "apellidos": fila["apellidos"].strip().title(),
+            "dni": fila.get("dni"),
+            "telefono": fila.get("telefono"),
+            "grupo_id": grupo.get("id"),
+            "dias_asiste": fila.get("dias_asiste"),
+            "fecha_inscripcion": (fila.get("_inicio") or logic.hoy()).isoformat(),
+        }).execute().data[0]
+        alumno_id = creado["id"]
+        codigo = creado.get("codigo", "")
+    else:
+        codigo = ""
+
+    plan = fila.get("_plan")
+    if plan and fila.get("_inicio"):
+        crear_paquete(
+            alumno_id, plan, fila["_inicio"],
+            float(fila.get("_cobrado") or 0), "IMPORTADO", True, "Carga masiva",
+            fecha_pedido=fila["_inicio"], sede=None,
+            dias_asiste=fila.get("dias_asiste"),
+            vendedor=fila.get("vendedor"),
+            tipo="NUEVO", grupo_id=grupo.get("id"),
+            precio_lista=float(fila.get("_lista") or fila.get("_cobrado") or 0),
+            monto_entregado=float(fila.get("_entregado") or 0))
+    return codigo
+
+
 def buscar_alumnos(texto: str, limite: int = 25) -> pd.DataFrame:
     """Busca por nombre, apellido, codigo, DNI o telefono.
 
@@ -486,6 +535,73 @@ def crear_paquete(alumno_id, plan: dict, fecha_inicio: date, precio: float,
 def actualizar_paquete(paquete_id: str, cambios: dict):
     limpio = {k: _iso(v) for k, v in cambios.items()}
     r = _tabla("paquetes").update(limpio).eq("id", paquete_id).execute().data
+    invalidar_cache()
+    return r
+
+
+def editar_pedido(paquete_id: str, plan: dict | None, fecha_inicio: date,
+                  sesiones: int, dias_asiste: str, grupo_id: str | None,
+                  precio_lista: float, precio: float, monto_entregado: float,
+                  fecha_limite_pago: date | None, vendedor: str | None,
+                  tipo: str, medio_pago: str, fecha_pedido: date,
+                  observacion: str | None, quien: str = "admin"):
+    """Corrige un pedido ya registrado y recalcula lo que dependa de eso.
+
+    Mover la fecha de inicio corre todo el calendario del alumno, asi que
+    la fecha de fin se vuelve a calcular aca y no se pide a mano: si se
+    escribiera, quedaria una fecha que no corresponde a ninguna sesion.
+
+    El numero de pedido y la fecha en que se cerro la venta no se tocan
+    desde la pantalla: son el rastro de la operacion original.
+    """
+    anterior = paquete(paquete_id) or {}
+    fecha_fin = logic.fecha_fin_por_calendario(
+        fecha_inicio, int(sesiones), dias_asiste,
+        int((plan or {}).get("vigencia_dias") or 30))
+
+    cambios = {
+        "fecha_inicio": fecha_inicio.isoformat(),
+        "fecha_fin": fecha_fin.isoformat(),
+        "fecha_pedido": fecha_pedido.isoformat(),
+        "sesiones_totales": int(sesiones),
+        "dias_asiste": dias_asiste,
+        "grupo_id": grupo_id,
+        "precio_lista": float(precio_lista),
+        "precio": float(precio),
+        "monto_entregado": float(monto_entregado),
+        "fecha_limite_pago": (fecha_limite_pago.isoformat()
+                              if fecha_limite_pago else None),
+        "vendedor": vendedor,
+        "tipo": tipo,
+        "medio_pago": medio_pago,
+        "observacion": observacion,
+    }
+    if plan:
+        cambios["plan_id"] = plan.get("id")
+        cambios["plan_nombre"] = plan["nombre"]
+
+    r = _tabla("paquetes").update(cambios).eq("id", paquete_id).execute().data
+
+    # Queda constancia de que se toco un pedido: es dinero y fechas que el
+    # cliente ya acordo, asi que tiene que poder rastrearse despues.
+    try:
+        detalle = []
+        for campo, etiqueta in (("fecha_inicio", "inicio"), ("precio", "precio"),
+                                ("sesiones_totales", "sesiones"),
+                                ("plan_nombre", "plan"), ("dias_asiste", "dias")):
+            antes = anterior.get(campo)
+            ahora = cambios.get(campo)
+            if ahora is not None and str(antes) != str(ahora):
+                detalle.append(f"{etiqueta}: {antes} -> {ahora}")
+        if detalle:
+            registrar_bloqueo(
+                anterior.get("alumno_id"),
+                f"Pedido {anterior.get('nro_pedido')} editado por {quien}. "
+                + "; ".join(detalle),
+                "PEDIDO_EDITADO")
+    except Exception:
+        pass
+
     invalidar_cache()
     return r
 
