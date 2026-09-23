@@ -27,7 +27,7 @@ theme.aplicar_estilos()
 
 # Se muestra en la barra lateral. Sirve para saber de un vistazo si la version
 # que estas viendo en la nube es la misma que tienes en tu computadora.
-VERSION = "3.2"
+VERSION = "3.3"
 
 DIAS_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
 TURNOS = ["MANANA", "TARDE", "NOCHE"]
@@ -154,7 +154,8 @@ def con_alertas(alumnos: pd.DataFrame) -> pd.DataFrame:
 PERMISOS = {
     "admin": ["Panel", "Marcar asistencia", "Renovaciones", "Alumnos",
               "Paquetes", "Congelamientos", "Reportes", "Planes",
-              "Dias sin entrenar", "Carga masiva", "Accesos"],
+              "Dias sin entrenar", "Carga masiva", "Accesos",
+              "Otros ingresos"],
     "entrenador": ["Panel", "Marcar asistencia", "Alumnos", "Renovaciones"],
 }
 
@@ -1786,6 +1787,11 @@ def pagina_reportes() -> None:
         cobrado_total = float(vendidos["precio"].sum()) if not vendidos.empty else 0.0
         descuento_total, pct_dcto = 0.0, 0.0
 
+    # Plata que entro sin alumno detras: partidos del domingo y otros cobros
+    extra = db.ingresos_extra(desde, hasta)
+    total_extra = (float(extra["monto"].fillna(0).astype(float).sum())
+                   if not extra.empty else 0.0)
+
     # Vendido no es lo mismo que cobrado: con pagos parciales, parte de lo
     # vendido todavia esta en la calle.
     if not vendidos.empty and "monto_entregado" in vendidos.columns:
@@ -1799,12 +1805,18 @@ def pagina_reportes() -> None:
         ("Paquetes vendidos", len(vendidos), "en el rango elegido"),
         ("Vendido", f"S/ {cobrado_total:,.0f}", "valor de los pedidos"),
         ("Cobrado", f"S/ {entrado:,.0f}", "entro a caja de verdad", "verde"),
+        ("Otros ingresos", f"S/ {total_extra:,.0f}", "partidos y cobros sueltos",
+         "verde"),
         ("Por cobrar", f"S/ {por_cobrar:,.0f}", "saldos pendientes",
          "rojo" if por_cobrar else "verde"),
         ("Descuentos", f"S/ {descuento_total:,.0f}",
          f"{pct_dcto:.1f}% del precio de lista",
          "ambar" if descuento_total else "neutro"),
     ])
+    st.caption(
+        f"Entro a caja en el periodo: **S/ {entrado + total_extra:,.2f}** "
+        f"(planes S/ {entrado:,.2f} + otros ingresos S/ {total_extra:,.2f})."
+    )
 
     st.divider()
     if asis.empty:
@@ -2157,7 +2169,94 @@ def pagina_carga_masiva() -> None:
 
 
 # =====================================================================
-# 10. DIAS SIN ENTRENAMIENTO
+# 10. OTROS INGRESOS
+# =====================================================================
+def pagina_otros_ingresos() -> None:
+    """Plata que entra sin un alumno detras.
+
+    El partido amistoso del domingo lo pagan varias personas sueltas y a
+    FutCross le interesa el total del dia, no quien pago cuanto. Cargar a
+    cada una como alumno con una clase suelta seria inflar el padron con
+    gente que no es alumna.
+    """
+    hoy = logic.hoy()
+    theme.cabecera("Otros ingresos", fecha_larga(hoy).upper(),
+                   "Partidos y cobros sueltos")
+    st.caption(
+        "Para la plata que entra sin un alumno detras: el partido amistoso "
+        "del domingo, un alquiler de cancha. Se registra el total del dia, no "
+        "persona por persona, y suma en Reportes como ingreso de caja."
+    )
+
+    # Se propone el domingo mas reciente (hoy mismo si es domingo), que es
+    # cuando se juegan los partidos.
+    domingo = hoy - timedelta(days=(hoy.weekday() + 1) % 7)
+
+    with st.form("form_ingreso_extra", clear_on_submit=True):
+        c1, c2 = st.columns([1, 2])
+        fecha = c1.date_input("Fecha", value=domingo, format="DD/MM/YYYY")
+        concepto = c2.text_input("Concepto", value="Partido amistoso domingo")
+
+        c3, c4, c5 = st.columns(3)
+        monto = c3.number_input("Monto total (S/)", min_value=0.0, step=10.0,
+                                help="Lo que se junto en total ese dia")
+        personas = c4.number_input("Cuantas personas (opcional)", min_value=0,
+                                   step=1, value=0)
+        medio = c5.selectbox("Metodo de pago", ["VARIOS"] + MEDIOS_PAGO)
+        notas = st.text_input("Notas", placeholder="Opcional")
+
+        if st.form_submit_button("Registrar ingreso", type="primary"):
+            if monto <= 0:
+                st.error("Pon el monto total que se cobro.")
+            elif not concepto.strip():
+                st.error("Ponle un concepto, por ejemplo Partido amistoso domingo.")
+            else:
+                try:
+                    db.registrar_ingreso_extra(
+                        fecha, concepto.strip(), float(monto),
+                        int(personas) or None, medio, notas.strip() or None)
+                    st.toast("Ingreso registrado", icon="\u2705")
+                    st.success(f"Registrado: S/ {monto:,.2f} del "
+                               f"{fecha_larga(fecha)}.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"No se pudo registrar: {e}")
+
+    theme.seccion("Registrados", "ultimos 90 dias")
+    datos = db.ingresos_extra(hoy - timedelta(days=90), hoy + timedelta(days=30))
+    if datos.empty:
+        theme.vacio("Todavia no hay ingresos registrados",
+                    "Cuando se juegue el partido del domingo, anota aca el total.")
+        return
+
+    total = float(datos["monto"].fillna(0).astype(float).sum())
+    st.caption(f"Total de los ultimos 90 dias: **S/ {total:,.2f}**")
+
+    for _, r in datos.iterrows():
+        f = logic.a_fecha(r["fecha"])
+        detalle = f"S/ {float(r['monto']):,.2f}"
+        gente = r.get("personas")
+        if gente is not None and pd.notna(gente) and int(gente) > 0:
+            detalle += f" · {int(gente)} personas"
+        # pandas convierte los vacios de la base en NaN, que es "verdadero"
+        # y se imprimia como "nan". Se filtran los dos casos.
+        for campo in ("medio_pago", "notas"):
+            valor = r.get(campo)
+            if valor is not None and pd.notna(valor) and str(valor).strip():
+                detalle += f" · {valor}"
+
+        c1, c2 = st.columns([5, 1])
+        with c1:
+            theme.fila(f"{fecha_larga(f).title()} · {r['concepto']}",
+                       detalle, theme.VERDE)
+        if c2.button("Quitar", key=f"quitar_ing_{r['id']}", width="stretch"):
+            db.eliminar_ingreso_extra(r["id"])
+            st.toast("Ingreso quitado", icon="\u2705")
+            st.rerun()
+
+
+# =====================================================================
+# 11. DIAS SIN ENTRENAMIENTO
 # =====================================================================
 def pagina_dias_libres() -> None:
     theme.cabecera("Dias sin entrenamiento", fecha_larga(logic.hoy()).upper(),
@@ -2222,7 +2321,7 @@ def pagina_dias_libres() -> None:
 
 
 # =====================================================================
-# 11. ACCESOS
+# 12. ACCESOS
 # =====================================================================
 def pagina_accesos() -> None:
     theme.cabecera("Accesos", fecha_larga(logic.hoy()).upper(), "Claves del equipo")
@@ -2312,12 +2411,14 @@ PAGINAS_ADMIN = {
     "Planes": pagina_planes,
     "Dias sin entrenar": pagina_dias_libres,
     "Carga masiva": pagina_carga_masiva,
+    "Otros ingresos": pagina_otros_ingresos,
     "Accesos": pagina_accesos,
 }
 
 GRUPOS = [
     ("Dia a dia", ["Panel", "Marcar asistencia", "Renovaciones"]),
-    ("Alumnos y pagos", ["Alumnos", "Paquetes", "Congelamientos"]),
+    ("Alumnos y pagos", ["Alumnos", "Paquetes", "Congelamientos",
+                         "Otros ingresos"]),
     ("Gestion", ["Reportes", "Planes", "Dias sin entrenar",
                  "Carga masiva", "Accesos"]),
 ]

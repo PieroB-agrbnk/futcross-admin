@@ -901,6 +901,45 @@ def intentos_fallidos_recientes(minutos: int = 15) -> int:
         return 0
 
 
+# ---------------------------------------------------------------------
+# Otros ingresos
+#
+# Plata que entra sin alumno asociado: el partido amistoso del domingo,
+# un alquiler de cancha. Se guarda el total del dia.
+# ---------------------------------------------------------------------
+@_cache(CACHE_CORTO)
+def ingresos_extra(desde: date, hasta: date) -> pd.DataFrame:
+    try:
+        rows = (_tabla("ingresos_extra").select("*")
+                .gte("fecha", desde.isoformat()).lte("fecha", hasta.isoformat())
+                .order("fecha", desc=True).execute().data)
+    except Exception:
+        # Si la migracion 023 todavia no se corrio, no romper la pantalla
+        return pd.DataFrame()
+    return _df(rows)
+
+
+def registrar_ingreso_extra(fecha: date, concepto: str, monto: float,
+                            personas: int | None = None,
+                            medio_pago: str | None = None,
+                            notas: str | None = None):
+    r = _tabla("ingresos_extra").insert({
+        "fecha": fecha.isoformat(),
+        "concepto": concepto,
+        "monto": float(monto),
+        "personas": personas,
+        "medio_pago": medio_pago,
+        "notas": notas,
+    }).execute().data
+    invalidar_cache()
+    return r
+
+
+def eliminar_ingreso_extra(ingreso_id: str) -> None:
+    _tabla("ingresos_extra").delete().eq("id", ingreso_id).execute()
+    invalidar_cache()
+
+
 @_cache(CACHE_CORTO)
 def bloqueos(desde: date, hasta: date) -> pd.DataFrame:
     rows = (_tabla("bloqueos").select("*, alumnos(codigo,nombres,apellidos,telefono)")
