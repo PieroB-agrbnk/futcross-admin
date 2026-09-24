@@ -27,7 +27,7 @@ theme.aplicar_estilos()
 
 # Se muestra en la barra lateral. Sirve para saber de un vistazo si la version
 # que estas viendo en la nube es la misma que tienes en tu computadora.
-VERSION = "3.3"
+VERSION = "3.4"
 
 DIAS_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
 TURNOS = ["MANANA", "TARDE", "NOCHE"]
@@ -127,6 +127,22 @@ def descargar_csv(etiqueta: str, datos: pd.DataFrame, archivo: str, clave=None) 
         etiqueta,
         datos.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
         archivo, "text/csv", key=clave)
+
+
+def avisar(mensaje: str, donde: str) -> None:
+    """Deja un aviso para mostrarlo despues de recargar la pantalla.
+
+    Despues de guardar se recarga todo para que las listas muestren el
+    cambio al toque. Un st.success comun se perderia en esa recarga, asi
+    que se guarda y se muestra en la vuelta siguiente.
+    """
+    st.session_state[f"aviso_{donde}"] = mensaje
+
+
+def mostrar_aviso(donde: str) -> None:
+    mensaje = st.session_state.pop(f"aviso_{donde}", None)
+    if mensaje:
+        st.success(mensaje)
 
 
 def con_alertas(alumnos: pd.DataFrame) -> pd.DataFrame:
@@ -756,23 +772,34 @@ def pagina_alumnos() -> None:
         editar_alumno()
 
     with tab_nuevo:
-        with st.form("form_alumno", clear_on_submit=True):
+        # Sin st.form a proposito: dentro de un formulario Streamlit no
+        # recalcula nada hasta que se guarda, y al cambiar de grupo la lista
+        # de dias se quedaba con la del grupo anterior. Asi cada cambio se ve
+        # al toque. `v` sube despues de guardar para dejar todo en blanco.
+        mostrar_aviso("inscripcion")
+        v = st.session_state.get("insc_v", 0)
+
+        def k(nombre):
+            return f"insc_{nombre}_{v}"
+
+        with st.container(border=True):
             c1, c2 = st.columns(2)
-            nombres = c1.text_input("Nombres *")
-            apellidos = c2.text_input("Apellidos *")
-            dni = c1.text_input("DNI", help="Es lo que el alumno escribe en la tablet")
-            telefono = c2.text_input("Telefono (9 digitos)",
+            nombres = c1.text_input("Nombres *", key=k("nombres"))
+            apellidos = c2.text_input("Apellidos *", key=k("apellidos"))
+            dni = c1.text_input("DNI", key=k("dni"),
+                                help="Es lo que el alumno escribe en la tablet")
+            telefono = c2.text_input("Telefono (9 digitos)", key=k("telefono"),
                                      help="Se usa para el WhatsApp de renovacion")
-            email = c1.text_input("Correo")
-            nacimiento = c2.date_input("Fecha de nacimiento", value=None,
+            email = c1.text_input("Correo", key=k("email"))
+            nacimiento = c2.date_input("Fecha de nacimiento", value=None, key=k("nac"),
                                        min_value=logic.hoy() - timedelta(days=365 * 80),
                                        max_value=logic.hoy(), format="DD/MM/YYYY")
-            inscripcion = c1.text_input("Fecha de inscripcion", value="", disabled=True,
-                                        placeholder="se toma la de hoy")
             inscripcion = logic.hoy()
-
-            emergencia = c2.text_input("Contacto de emergencia")
-            notas = st.text_area("Notas", placeholder="Lesiones previas, observaciones, etc.")
+            emergencia = c1.text_input("Contacto de emergencia", key=k("emergencia"))
+            c2.text_input("Fecha de inscripcion", value=inscripcion.strftime("%d/%m/%Y"),
+                          disabled=True, key=k("inscripcion"))
+            notas = st.text_area("Notas", key=k("notas"),
+                                 placeholder="Lesiones previas, observaciones, etc.")
 
             # Un alumno nuevo casi siempre entra comprando. Se hace en el mismo
             # paso para no obligar a ir despues a la pantalla de Paquetes.
@@ -780,72 +807,75 @@ def pagina_alumnos() -> None:
             # semana entrena, y eso define que dias se pueden marcar.
             st.markdown("**Plan que contrata**")
             planes_disp = db.listar_planes()
-            vender_ahora = st.checkbox("Registrar su primer pedido ahora",
+            vender_ahora = st.checkbox("Registrar su primer pedido ahora", key=k("vender"),
                                        value=not planes_disp.empty,
                                        disabled=planes_disp.empty)
             if planes_disp.empty:
                 st.caption("No hay planes activos. Crealos en la pantalla Planes.")
 
             plan_elegido = None
-            inicio_plan = precio_plan = medio_plan = vendedor_plan = None
+            inicio_plan = None
             frecuencia_plan = None
             if not planes_disp.empty:
                 q1, q2 = st.columns([2, 1])
-                nombre_plan = q1.selectbox("Plan", planes_disp["nombre"].tolist())
+                nombre_plan = q1.selectbox("Plan", planes_disp["nombre"].tolist(),
+                                           key=k("plan"))
                 plan_elegido = planes_disp[
                     planes_disp["nombre"] == nombre_plan].iloc[0].to_dict()
                 inicio_plan = q2.date_input("Inicio del plan", value=logic.hoy(),
-                                            format="DD/MM/YYYY")
+                                            format="DD/MM/YYYY", key=k("inicio"))
                 frecuencia_plan = plan_elegido.get("dias_por_semana")
                 if frecuencia_plan is not None and pd.isna(frecuencia_plan):
                     frecuencia_plan = None
 
             st.markdown("**Grupo y dias que entrena**")
             grupo_id, dias_grupo, detalle = selector_de_grupo(
-                "Sede, horario y genero", clave="grupo_nuevo_alumno",
+                "Sede, horario y genero", clave=k("grupo"),
                 dias_del_plan=int(frecuencia_plan) if frecuencia_plan else None)
             if detalle:
                 st.caption(detalle)
-            sede = dias = horario = turno = None
 
+            lista_plan = precio_plan = medio_plan = None
+            recibido_plan = vendedor_plan = None
+            fin_plan = None
             if plan_elegido is not None:
                 fin_plan = logic.fecha_fin_por_calendario(
                     inicio_plan, int(plan_elegido["sesiones"]), dias_grupo,
-                    int(plan_elegido["vigencia_dias"]))
+                    int(plan_elegido["vigencia_dias"]),
+                    excluir=db.fechas_sin_entrenar(grupo_id))
                 if dias_grupo:
                     st.info(
-                        f"**{plan_elegido['sesiones']} sesiones** entrenando "
+                        f"**{logic.sesiones_txt(plan_elegido['sesiones'])}** entrenando "
                         f"{logic.frecuencia(dias_grupo)} ({dias_grupo}). "
                         f"Ultima sesion el **{fecha_larga(fin_plan)}**."
                     )
 
-            if plan_elegido is not None:
-
+                # La clave del precio incluye el plan: al cambiar de plan se
+                # propone el precio del nuevo, no se queda el del anterior.
+                kp = f"{k('precio')}_{plan_elegido.get('id')}"
                 r1, r2, r3 = st.columns(3)
                 lista_plan = r1.number_input(
-                    "Precio de lista (S/)", min_value=0.0,
-                    value=float(plan_elegido["precio"]), step=10.0,
-                    key="lista_inscripcion")
+                    "Precio de lista (S/)", min_value=0.0, step=10.0,
+                    value=float(plan_elegido["precio"]), key=kp + "_lista")
                 precio_plan = r2.number_input(
-                    "Precio cobrado (S/)", min_value=0.0,
-                    value=float(plan_elegido["precio"]), step=1.0,
-                    key="cobrado_inscripcion",
+                    "Precio cobrado (S/)", min_value=0.0, step=1.0,
+                    value=float(plan_elegido["precio"]), key=kp + "_cobrado",
                     help="Lo que paga el cliente, con descuento si hubo")
-                medio_plan = r3.selectbox("Metodo de pago", MEDIOS_PAGO,
-                                          key="medio_inscripcion")
+                medio_plan = r3.selectbox("Metodo de pago", MEDIOS_PAGO, key=k("medio"))
                 if lista_plan - precio_plan > 0:
                     d = lista_plan - precio_plan
                     st.caption(f"Descuento: **S/ {d:,.2f}** "
                                f"({d / lista_plan * 100:.1f}%)")
-                recibido_plan = st.text_input("Recibido por", placeholder="Ej. GARY",
-                                              key="recibido_inscripcion")
-                vendedor_plan = st.text_input("Vendedor", key="vendedor_inscripcion",
-                                              placeholder="Ej. EDDIMAR")
+                s1, s2 = st.columns(2)
+                recibido_plan = s1.text_input("Recibido por", placeholder="Ej. GARY",
+                                              key=k("recibido"))
+                vendedor_plan = s2.text_input("Vendedor", placeholder="Ej. EDDIMAR",
+                                              key=k("vendedor"))
 
-            if st.form_submit_button("Guardar alumno", type="primary"):
+            if st.button("Guardar alumno", type="primary", key=k("guardar")):
                 if vender_ahora and plan_elegido is not None and not dias_grupo:
                     st.error("Marca al menos un dia de entrenamiento.")
-                elif not nombres or not apellidos:
+                elif not nombres.strip() or not apellidos.strip():
                     st.error("Nombres y apellidos son obligatorios.")
                 else:
                     try:
@@ -867,7 +897,7 @@ def pagina_alumnos() -> None:
                         if vender_ahora and plan_elegido:
                             medio_full = (f"{medio_plan} {recibido_plan}".strip()
                                           if recibido_plan else medio_plan)
-                            db.crear_paquete(
+                            guardado = db.crear_paquete(
                                 alumno_nuevo["id"], plan_elegido, inicio_plan,
                                 precio_plan, medio_full, True, None,
                                 fecha_pedido=logic.hoy(), sede=None,
@@ -875,16 +905,21 @@ def pagina_alumnos() -> None:
                                 vendedor=(vendedor_plan or "").strip().upper() or None,
                                 tipo="NUEVO", grupo_id=grupo_id,
                                 precio_lista=lista_plan)
-                            fin_final = logic.fecha_fin_por_calendario(
-                                inicio_plan, int(plan_elegido["sesiones"]), dias_grupo,
-                                int(plan_elegido["vigencia_dias"]))
+                            # La fecha que manda es la que guardo la base
+                            fin_final = fin_plan
+                            if guardado and isinstance(guardado, list) \
+                                    and guardado[0].get("fecha_fin"):
+                                fin_final = logic.a_fecha(guardado[0]["fecha_fin"])
                             aviso += (f" Se registro su {plan_elegido['nombre']}: "
                                       f"ultima sesion el {fecha_larga(fin_final)}.")
                         else:
                             aviso += " Asignale un paquete en la pantalla Paquetes."
 
                         st.toast("Alumno registrado", icon="\u2705")
-                        st.success(aviso)
+                        avisar(aviso, "inscripcion")
+                        # Formulario en blanco y lista al dia, sin volver a entrar
+                        st.session_state["insc_v"] = v + 1
+                        st.rerun()
                     except Exception as e:
                         st.error(f"No se pudo guardar: {e}")
 
@@ -895,6 +930,7 @@ def editar_alumno() -> None:
     Todo llega precargado con lo que ya tiene, asi que solo se toca lo que
     cambia. Tambien permite darlo de baja sin borrar su historial.
     """
+    mostrar_aviso("editar_alumno")
     todos = db.panel_alumnos(solo_activos=False)
     if todos.empty:
         theme.vacio("No hay alumnos", "Primero inscribe a alguien.")
@@ -927,22 +963,29 @@ def editar_alumno() -> None:
     turno_actual = texto("turno") or TURNOS[0]
     dias_actuales = [d for d in texto("dias_asiste").split() if d in DIAS_SEMANA]
 
-    with st.form("form_editar_alumno"):
+    # Sin st.form: si se cambia de grupo, los dias disponibles tienen que
+    # cambiar al toque. Las claves llevan el id del alumno, asi al elegir a
+    # otro se cargan sus datos y no quedan los del anterior.
+    def k(nombre):
+        return f"ea_{alumno_id}_{nombre}"
+
+    with st.container(border=True):
         c1, c2 = st.columns(2)
-        nombres = c1.text_input("Nombres *", value=texto("nombres"))
-        apellidos = c2.text_input("Apellidos *", value=texto("apellidos"))
-        dni = c1.text_input("DNI", value=texto("dni"))
-        telefono = c2.text_input("Telefono", value=texto("telefono"))
-        email = c1.text_input("Correo", value=texto("email"))
+        nombres = c1.text_input("Nombres *", value=texto("nombres"), key=k("nombres"))
+        apellidos = c2.text_input("Apellidos *", value=texto("apellidos"),
+                                  key=k("apellidos"))
+        dni = c1.text_input("DNI", value=texto("dni"), key=k("dni"))
+        telefono = c2.text_input("Telefono", value=texto("telefono"), key=k("telefono"))
+        email = c1.text_input("Correo", value=texto("email"), key=k("email"))
 
         nac = logic.a_fecha(a.get("fecha_nacimiento"))
-        nacimiento = c2.date_input("Fecha de nacimiento", value=nac,
+        nacimiento = c2.date_input("Fecha de nacimiento", value=nac, key=k("nac"),
                                    min_value=logic.hoy() - timedelta(days=365 * 80),
                                    max_value=logic.hoy(), format="DD/MM/YYYY")
 
         st.markdown("**Grupo y dias que entrena**")
         grupo_id, dias_grupo, detalle = selector_de_grupo(
-            "Sede, horario y genero", clave="grupo_editar",
+            "Sede, horario y genero", clave=k("grupo"),
             grupo_actual=a.get("grupo_id"),
             dias_previos=texto("dias_asiste"))
         if detalle:
@@ -950,22 +993,24 @@ def editar_alumno() -> None:
         sede = turno = horario = None
 
         e1, e2 = st.columns(2)
-        emergencia = e1.text_input("Contacto de emergencia",
+        emergencia = e1.text_input("Contacto de emergencia", key=k("emergencia"),
                                    value=texto("contacto_emergencia"))
         activo = e2.selectbox(
-            "Estado del alumno", ["Activo", "Dado de baja"],
+            "Estado del alumno", ["Activo", "Dado de baja"], key=k("activo"),
             index=0 if a.get("activo", True) else 1,
             help="Dar de baja lo saca de los listados pero conserva su historial",
         ) == "Activo"
-        notas = st.text_area("Notas", value=texto("notas"))
+        notas = st.text_area("Notas", value=texto("notas"), key=k("notas"))
 
         st.caption(f"Codigo {a['codigo']} - inscrito el "
                    f"{logic.a_fecha(a['fecha_inscripcion']).strftime('%d/%m/%Y')}. "
                    "El codigo y la fecha de inscripcion no se modifican.")
 
-        if st.form_submit_button("Guardar cambios", type="primary"):
+        if st.button("Guardar cambios", type="primary", key=k("guardar")):
             if not nombres.strip() or not apellidos.strip():
                 st.error("Nombres y apellidos son obligatorios.")
+            elif not dias_grupo:
+                st.error("Marca al menos un dia de entrenamiento.")
             else:
                 try:
                     db.actualizar_alumno(alumno_id, {
@@ -982,7 +1027,12 @@ def editar_alumno() -> None:
                         "activo": activo,
                     })
                     st.toast("Alumno actualizado", icon="\u2705")
-                    st.success(f"Datos de {nombres} {apellidos} actualizados.")
+                    avisar(f"Datos de {nombres.strip()} {apellidos.strip()} "
+                           "actualizados.", "editar_alumno")
+                    # Se borran las claves de este alumno para que, al
+                    # recargar, se vean los datos recien guardados
+                    for clave in [c for c in st.session_state if str(c).startswith(k(""))]:
+                        del st.session_state[clave]
                     st.rerun()
                 except Exception as e:
                     st.error(f"No se pudo guardar: {e}")
@@ -1051,8 +1101,9 @@ def ficha_alumno(alumno_id: str) -> None:
         if dias_pv and not pd.isna(dias_pv):
             usadas_pv = int(pv["sesiones_usadas"])
             totales_pv = int(pv["sesiones_totales"])
-            todas = logic.proximas_sesiones(logic.a_fecha(pv["fecha_inicio"]),
-                                            totales_pv, dias_pv)
+            todas = logic.proximas_sesiones(
+                logic.a_fecha(pv["fecha_inicio"]), totales_pv, dias_pv,
+                excluir=db.fechas_sin_entrenar(pv.get("grupo_id")))
             if todas:
                 with st.expander(
                         f"Cronograma de sus {totales_pv} sesiones "
@@ -1105,6 +1156,7 @@ def editar_pedido(planes) -> None:
     domingo avisa que mejor el miercoles. Antes habia que anular el
     pedido y cargarlo de nuevo, perdiendo el numero y la fecha de venta.
     """
+    mostrar_aviso("editar_pedido")
     pedidos = db.listar_paquetes()
     if pedidos.empty:
         theme.vacio("Sin pedidos", "Registra el primero en la otra pestana.")
@@ -1137,55 +1189,64 @@ def editar_pedido(planes) -> None:
     else:
         st.info("Este plan todavia no arranca, se puede mover sin problema.")
 
-    with st.form("form_editar_pedido"):
+    # Sin st.form: al cambiar el plan, el grupo o la fecha, las fechas de
+    # clase tienen que recalcularse al toque. Las claves llevan el id del
+    # pedido, asi al elegir otro se cargan sus datos.
+    def k(nombre):
+        return f"ep_{pq['id']}_{nombre}"
+
+    with st.container(border=True):
         c1, c2, c3 = st.columns([2, 1, 1])
         nombres_planes = planes["nombre"].tolist()
         actual = pq.get("plan_nombre")
         indice = nombres_planes.index(actual) if actual in nombres_planes else 0
-        nombre_plan = c1.selectbox("Plan contratado", nombres_planes, index=indice)
+        nombre_plan = c1.selectbox("Plan contratado", nombres_planes, index=indice,
+                                   key=k("plan"))
         plan = planes[planes["nombre"] == nombre_plan].iloc[0].to_dict()
 
         fecha_pedido = c2.date_input(
             "Fecha del pedido", value=logic.a_fecha(pq.get("fecha_pedido")),
-            format="DD/MM/YYYY", help="Cuando se cerro la venta. No suele cambiar.")
+            format="DD/MM/YYYY", key=k("fecha_pedido"),
+            help="Cuando se cerro la venta. No suele cambiar.")
         inicio = c3.date_input(
             "Inicio del plan", value=logic.a_fecha(pq["fecha_inicio"]),
-            format="DD/MM/YYYY",
+            format="DD/MM/YYYY", key=k("inicio"),
             help="Al cambiarla se recalculan todas las fechas del alumno")
 
         st.markdown("**Grupo y dias que entrena**")
         grupo_id, dias_grupo, detalle = selector_de_grupo(
-            "Sede, horario y genero", clave="grupo_edicion",
+            "Sede, horario y genero", clave=k("grupo"),
             grupo_actual=pq.get("grupo_id"),
             dias_previos=str(pq.get("dias_asiste") or ""))
         if detalle:
             st.caption(detalle)
 
+        # Si se cambia de plan, se proponen las sesiones del plan nuevo
+        mismo_plan = nombre_plan == actual
         a1, a2 = st.columns(2)
-        sesiones = a1.number_input("Sesiones", min_value=1,
-                                   value=int(pq["sesiones_totales"]))
+        sesiones = a1.number_input(
+            "Sesiones", min_value=1, key=k(f"sesiones_{nombre_plan}"),
+            value=int(pq["sesiones_totales"]) if mismo_plan else int(plan["sesiones"]))
         tipo = a2.selectbox("Renovacion o nuevo", ["NUEVO", "RENOVACION"],
-                            index=1 if pq.get("tipo") == "RENOVACION" else 0)
-
-        fin = logic.fecha_fin_por_calendario(
-            inicio, int(sesiones), dias_grupo, int(plan["vigencia_dias"]))
+                            index=1 if pq.get("tipo") == "RENOVACION" else 0,
+                            key=k("tipo"))
 
         st.markdown("**Cobro**")
         e1, e2, e3 = st.columns(3)
         precio_lista = e1.number_input(
-            "Precio de lista (S/)", min_value=0.0, step=10.0,
+            "Precio de lista (S/)", min_value=0.0, step=10.0, key=k("lista"),
             value=float(pq.get("precio_lista") or pq.get("precio") or 0))
         precio = e2.number_input("Precio cobrado (S/)", min_value=0.0, step=1.0,
-                                 value=float(pq.get("precio") or 0))
+                                 value=float(pq.get("precio") or 0), key=k("precio"))
         entregado = e3.number_input(
-            "Monto entregado (S/)", min_value=0.0, step=10.0,
+            "Monto entregado (S/)", min_value=0.0, step=10.0, key=k("entregado"),
             value=float(pq.get("monto_entregado") or 0))
 
         saldo = max(0.0, precio - entregado)
         f1, f2 = st.columns(2)
         if saldo > 0:
             limite = f1.date_input(
-                "Pagar el saldo hasta",
+                "Pagar el saldo hasta", key=k("limite"),
                 value=logic.a_fecha(pq.get("fecha_limite_pago"))
                 or logic.hoy() + timedelta(days=15), format="DD/MM/YYYY")
             f1.caption(f"Queda debiendo **S/ {saldo:,.2f}**")
@@ -1193,41 +1254,83 @@ def editar_pedido(planes) -> None:
             limite = None
             f1.caption("Sin saldo pendiente.")
         medio = f2.selectbox(
-            "Metodo de pago", MEDIOS_PAGO,
+            "Metodo de pago", MEDIOS_PAGO, key=k("medio"),
             index=next((i for i, m in enumerate(MEDIOS_PAGO)
                         if str(pq.get("medio_pago") or "").upper().startswith(m)), 0))
 
-        vendedor = st.text_input("Vendedor", value=str(pq.get("vendedor") or ""))
-        obs = st.text_input("Observacion", value=str(pq.get("observacion") or ""))
+        vendedor = st.text_input("Vendedor", value=str(pq.get("vendedor") or ""),
+                                 key=k("vendedor"))
+        obs = st.text_input("Observacion", value=str(pq.get("observacion") or ""),
+                            key=k("obs"))
 
-        cronograma = logic.proximas_sesiones(inicio, int(sesiones), dias_grupo)
-        if cronograma:
+        # --- Fecha de fin: automatica, o fijada a mano para casos especiales
+        st.markdown("**Fecha de fin**")
+        fin_guardado = logic.a_fecha(pq["fecha_fin"])
+        fijar = st.checkbox(
+            "Fijar la fecha de fin a mano", value=bool(pq.get("fin_manual")),
+            key=k("fijar"),
+            help="Solo para casos especiales. Los feriados y los congelamientos "
+                 "ya corren la fecha solos.")
+        fin_manual = motivo_fin = None
+        if fijar:
+            m1, m2 = st.columns([1, 2])
+            fin_manual = m1.date_input("Ultima sesion", value=fin_guardado,
+                                       min_value=inicio, format="DD/MM/YYYY",
+                                       key=k("fin_manual"))
+            motivo_fin = m2.text_input(
+                "Motivo", value=str(pq.get("fin_manual_motivo") or ""),
+                placeholder="Ej. compensacion por una clase cancelada",
+                key=k("motivo_fin"))
+            st.caption("Con la fecha fijada a mano el plan sigue activo hasta ese "
+                       "dia, y los feriados o congelamientos ya no la mueven. Para "
+                       "volver al calculo automatico, desmarca la casilla.")
+
+        cambio_calendario = (
+            inicio != logic.a_fecha(pq["fecha_inicio"])
+            or int(sesiones) != int(pq["sesiones_totales"])
+            or dias_grupo != str(pq.get("dias_asiste") or "")
+            or grupo_id != pq.get("grupo_id"))
+        sin_entrenar = db.fechas_sin_entrenar(grupo_id)
+        if fijar:
+            fin = fin_manual
+        elif cambio_calendario:
+            fin = logic.fecha_fin_por_calendario(
+                inicio, int(sesiones), dias_grupo, int(plan["vigencia_dias"]),
+                excluir=sin_entrenar)
+        else:
+            fin = fin_guardado
+
+        cronograma = logic.proximas_sesiones(inicio, int(sesiones), dias_grupo,
+                                             excluir=sin_entrenar)
+        if cronograma and fin:
             st.info(
-                f"**{sesiones} sesiones** entrenando "
+                f"**{logic.sesiones_txt(sesiones)}** entrenando "
                 f"{logic.frecuencia(dias_grupo)} ({dias_grupo}). "
                 f"Primera el {fecha_larga(cronograma[0])}, ultima el "
                 f"**{fecha_larga(fin)}**."
             )
-            anterior_fin = logic.a_fecha(pq["fecha_fin"])
-            if anterior_fin and anterior_fin != fin:
+            if fin_guardado and fin != fin_guardado:
                 st.warning(f"La ultima sesion se mueve del "
-                           f"{anterior_fin.strftime('%d/%m/%Y')} al "
+                           f"{fin_guardado.strftime('%d/%m/%Y')} al "
                            f"{fin.strftime('%d/%m/%Y')}.")
-            if len(cronograma) <= 12:
-                st.caption("Fechas: " + " · ".join(
-                    f.strftime("%d/%m") for f in cronograma))
+            if cambio_calendario and not fijar:
+                st.caption("Si tiene feriados o congelamientos, el sistema los "
+                           "descuenta al guardar y ajusta la fecha final.")
 
         confirmar = st.checkbox(
-            "Confirmo el cambio", value=not empezado,
+            "Confirmo el cambio", value=not empezado, key=k("confirmar"),
             help="Si el plan ya empezo, revisa bien antes de guardar")
 
-        if st.form_submit_button("Guardar cambios", type="primary"):
+        if st.button("Guardar cambios", type="primary", key=k("guardar")):
             if not dias_grupo:
                 st.error("Marca al menos un dia de entrenamiento.")
             elif not confirmar:
                 st.error("Marca la casilla de confirmacion.")
             elif entregado > precio:
                 st.error("El monto entregado no puede ser mayor al cobrado.")
+            elif fijar and not (motivo_fin or "").strip():
+                st.error("Escribe el motivo de la fecha puesta a mano: queda "
+                         "registrado.")
             else:
                 try:
                     db.editar_pedido(
@@ -1235,12 +1338,17 @@ def editar_pedido(planes) -> None:
                         grupo_id, precio_lista, precio, entregado, limite,
                         (vendedor or "").strip().upper() or None, tipo, medio,
                         fecha_pedido, obs or None,
-                        quien=ETIQUETA_ROL.get(rol(), ""))
+                        quien=ETIQUETA_ROL.get(rol(), ""),
+                        fin_manual=fin_manual if fijar else None,
+                        motivo_fin=(motivo_fin or "").strip() or None)
+                    nuevo = db.paquete(pq["id"]) or {}
+                    fin_real = logic.a_fecha(nuevo.get("fecha_fin")) or fin
                     st.toast("Pedido corregido", icon="\u2705")
-                    st.success(
-                        f"Pedido actualizado. Su ultima sesion queda el "
-                        f"{fecha_larga(fin)}."
-                    )
+                    avisar(f"Pedido actualizado. Su ultima sesion queda el "
+                           f"{fecha_larga(fin_real)}.", "editar_pedido")
+                    for clave in [c for c in st.session_state
+                                  if str(c).startswith(k(""))]:
+                        del st.session_state[clave]
                     st.rerun()
                 except Exception as e:
                     st.error(f"No se pudo guardar: {e}")
@@ -1272,6 +1380,7 @@ def pagina_paquetes() -> None:
         editar_pedido(planes)
 
     with tab_vender:
+        mostrar_aviso("venta")
         alumnos = db.panel_alumnos()
         if alumnos.empty:
             theme.vacio("Todavia no hay alumnos",
@@ -1305,14 +1414,21 @@ def pagina_paquetes() -> None:
             except Exception:
                 pedido, lista_vendedores, lista_sedes = 1, [], ["SURQUILLO"]
 
-            with st.form("form_paquete"):
+            # Sin st.form: al cambiar de plan o de grupo, los dias, el precio
+            # y las fechas se recalculan al toque. Las claves llevan el id del
+            # alumno, asi al elegir a otro se cargan sus datos.
+            def k(nombre):
+                return f"venta_{alumno_id}_{nombre}_{st.session_state.get('venta_v', 0)}"
+
+            with st.container(border=True):
                 st.markdown(f"**Pedido N {pedido}**")
 
                 c1, c2, c3 = st.columns([2, 1, 1])
-                nombre_plan = c1.selectbox("Plan contratado", planes["nombre"].tolist())
+                nombre_plan = c1.selectbox("Plan contratado", planes["nombre"].tolist(),
+                                           key=k("plan"))
                 plan = planes[planes["nombre"] == nombre_plan].iloc[0].to_dict()
                 fecha_pedido = c2.date_input("Fecha del pedido", value=logic.hoy(),
-                                             format="DD/MM/YYYY",
+                                             format="DD/MM/YYYY", key=k("fecha_pedido"),
                                              help="Cuando se cerro la venta")
 
                 # Si ya tiene un paquete corriendo, lo natural es que el nuevo
@@ -1326,6 +1442,7 @@ def pagina_paquetes() -> None:
 
                 inicio = c3.date_input(
                     "Inicio del plan", value=sugerido, format="DD/MM/YYYY",
+                    key=k("inicio"),
                     help="Si ya tiene un paquete, se propone el dia siguiente al "
                          "que termina, para que las sesiones se sumen")
 
@@ -1341,37 +1458,45 @@ def pagina_paquetes() -> None:
                 if frec is not None and pd.isna(frec):
                     frec = None
                 grupo_id, dias_grupo, detalle = selector_de_grupo(
-                    "Sede, horario y genero", clave="grupo_venta",
+                    "Sede, horario y genero", clave=k("grupo"),
                     grupo_actual=grupo_previo, dias_previos=str(dias_previos),
                     dias_del_plan=int(frec) if frec else None)
                 if detalle:
                     st.caption(detalle)
 
+                # Lo que depende del plan lleva el plan en la clave: al cambiar
+                # de plan se proponen sus sesiones y su precio, no los del
+                # anterior.
+                kp = f"{k('p')}_{plan.get('id')}"
+
                 # Ajuste para una venta puntual, sin tocar el catalogo de planes
                 a1, a2 = st.columns(2)
                 sesiones = a1.number_input("Sesiones", min_value=1,
-                                           value=int(plan["sesiones"]),
+                                           value=int(plan["sesiones"]), key=kp + "_ses",
                                            help="Cambialo solo si esta venta es una excepcion")
                 vigencia = a2.number_input("Dias de vigencia (respaldo)", min_value=1,
                                            value=int(plan["vigencia_dias"]),
+                                           key=kp + "_vig",
                                            help="Solo se usa si el grupo no tiene dias")
 
-                # La fecha de fin es la de la ultima sesion en el calendario del grupo
+                # La fecha de fin es la de la ultima sesion en el calendario del
+                # grupo, saltando los dias sin entrenamiento ya marcados
+                sin_entrenar = db.fechas_sin_entrenar(grupo_id)
                 fin = logic.fecha_fin_por_calendario(inicio, int(sesiones), dias_grupo,
-                                                     int(vigencia))
+                                                     int(vigencia), excluir=sin_entrenar)
                 sede = None
 
                 st.markdown("**Cobro**")
                 e1, e2, e3 = st.columns(3)
                 precio_lista = e1.number_input(
                     "Precio de lista (S/)", value=float(plan["precio"]),
-                    min_value=0.0, step=10.0,
+                    min_value=0.0, step=10.0, key=kp + "_lista",
                     help="El del catalogo. Se completa solo con el del plan.")
                 precio = e2.number_input(
                     "Precio cobrado (S/)", value=float(plan["precio"]),
-                    min_value=0.0, step=1.0,
+                    min_value=0.0, step=1.0, key=kp + "_cobrado",
                     help="Lo que realmente paga el cliente, con descuento si hubo")
-                medio = e3.selectbox("Metodo de pago", MEDIOS_PAGO)
+                medio = e3.selectbox("Metodo de pago", MEDIOS_PAGO, key=k("medio"))
 
                 dcto = precio_lista - precio
                 if dcto > 0:
@@ -1382,15 +1507,17 @@ def pagina_paquetes() -> None:
                                "precio de lista.")
 
                 recibido = st.text_input("Recibido por", placeholder="Ej. GARY",
+                                         key=k("recibido"),
                                          help="Queda registrado como 'YAPE GARY'")
 
                 # FutCross a veces cobra la mitad ahora y la otra mitad en
-                # quince dias. Antes eso no habia donde registrarlo: marcar
-                # "Pendiente" hacia que lo que si entro a caja no contara.
+                # quince dias. La clave lleva el precio cobrado: si cambia, el
+                # monto entregado vuelve a proponer el pago completo.
                 g1, g2 = st.columns(2)
                 entregado = g1.number_input(
                     "Monto entregado (S/)", value=float(precio),
                     min_value=0.0, max_value=float(precio), step=10.0,
+                    key=f"{kp}_entregado_{precio}",
                     help="Cuanto paga ahora. Dejalo igual al precio si paga todo.")
                 saldo = max(0.0, precio - entregado)
                 pagado = saldo <= 0
@@ -1398,7 +1525,7 @@ def pagina_paquetes() -> None:
                 if saldo > 0:
                     limite = g2.date_input(
                         "Pagar el saldo hasta", value=logic.hoy() + timedelta(days=15),
-                        min_value=logic.hoy(), format="DD/MM/YYYY",
+                        min_value=logic.hoy(), format="DD/MM/YYYY", key=k("limite"),
                         help="Plazo acordado con el cliente")
                     g2.caption(f"Queda debiendo **S/ {saldo:,.2f}**")
                 else:
@@ -1408,15 +1535,16 @@ def pagina_paquetes() -> None:
                 f1, f2 = st.columns(2)
                 es_renovacion = bool(vigente) or bool(db.ultimo_paquete(alumno_id))
                 tipo = f1.selectbox("Renovacion o nuevo", ["NUEVO", "RENOVACION"],
-                                    index=1 if es_renovacion else 0)
+                                    index=1 if es_renovacion else 0, key=k("tipo"))
                 if lista_vendedores:
-                    vendedor = f2.selectbox("Vendedor", lista_vendedores + ["Otro..."])
+                    vendedor = f2.selectbox("Vendedor", lista_vendedores + ["Otro..."],
+                                            key=k("vendedor"))
                 else:
                     vendedor = "Otro..."
                 if vendedor == "Otro...":
-                    vendedor = f2.text_input("Nombre del vendedor", key="vend_nuevo")
+                    vendedor = f2.text_input("Nombre del vendedor", key=k("vend_nuevo"))
 
-                obs = st.text_input("Observacion", placeholder="Opcional")
+                obs = st.text_input("Observacion", placeholder="Opcional", key=k("obs"))
 
                 if vigente is not None:
                     fin_actual = logic.a_fecha(vigente["fecha_fin"])
@@ -1436,10 +1564,11 @@ def pagina_paquetes() -> None:
                             f"uno detras del otro, pon el inicio despues de esa fecha."
                         )
 
-                cronograma = logic.proximas_sesiones(inicio, int(sesiones), dias_grupo)
+                cronograma = logic.proximas_sesiones(inicio, int(sesiones), dias_grupo,
+                                                     excluir=sin_entrenar)
                 if cronograma:
                     st.info(
-                        f"**{sesiones} sesiones** entrenando "
+                        f"**{logic.sesiones_txt(sesiones)}** entrenando "
                         f"{logic.frecuencia(dias_grupo)} ({dias_grupo}). "
                         f"Primera el {fecha_larga(cronograma[0])}, ultima el "
                         f"**{fecha_larga(fin)}**."
@@ -1448,18 +1577,18 @@ def pagina_paquetes() -> None:
                         st.caption("Fechas: " + " · ".join(
                             f.strftime("%d/%m") for f in cronograma))
                 else:
-                    st.info(f"**{sesiones} sesiones** del "
+                    st.info(f"**{logic.sesiones_txt(sesiones)}** del "
                             f"{inicio.strftime('%d/%m/%Y')} al "
                             f"**{fin.strftime('%d/%m/%Y')}**.")
 
-                if st.form_submit_button("Registrar pedido", type="primary"):
+                if st.button("Registrar pedido", type="primary", key=k("guardar")):
                     if not dias_grupo:
                         st.error("Marca al menos un dia de entrenamiento antes de "
                                  "registrar el pedido.")
                         st.stop()
                     medio_completo = f"{medio} {recibido}".strip() if recibido else medio
                     try:
-                        db.crear_paquete(
+                        guardado = db.crear_paquete(
                             alumno_id, plan, inicio, precio, medio_completo, pagado,
                             obs or None, fecha_pedido=fecha_pedido, sede=sede,
                             dias_asiste=dias_grupo,
@@ -1467,14 +1596,19 @@ def pagina_paquetes() -> None:
                             tipo=tipo, sesiones=int(sesiones), vigencia_dias=int(vigencia),
                             grupo_id=grupo_id, precio_lista=precio_lista,
                             monto_entregado=entregado, fecha_limite_pago=limite)
+                        fin_real = fin
+                        if guardado and isinstance(guardado, list) \
+                                and guardado[0].get("fecha_fin"):
+                            fin_real = logic.a_fecha(guardado[0]["fecha_fin"])
                         st.toast(f"Pedido {pedido} registrado", icon="\u2705")
                         aviso_pedido = (f"Pedido N {pedido} registrado. "
-                                        f"Vence el {fin.strftime('%d/%m/%Y')}.")
+                                        f"Ultima sesion el {fin_real.strftime('%d/%m/%Y')}.")
                         if saldo > 0:
                             aviso_pedido += (f" Queda un saldo de S/ {saldo:,.2f} "
                                              f"con plazo hasta el "
                                              f"{limite.strftime('%d/%m/%Y')}.")
-                        st.success(aviso_pedido)
+                        avisar(aviso_pedido, "venta")
+                        st.session_state["venta_v"] = st.session_state.get("venta_v", 0) + 1
                         st.rerun()
                     except Exception as e:
                         st.error(f"No se pudo registrar: {e}")

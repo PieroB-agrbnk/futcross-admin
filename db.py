@@ -544,7 +544,8 @@ def editar_pedido(paquete_id: str, plan: dict | None, fecha_inicio: date,
                   precio_lista: float, precio: float, monto_entregado: float,
                   fecha_limite_pago: date | None, vendedor: str | None,
                   tipo: str, medio_pago: str, fecha_pedido: date,
-                  observacion: str | None, quien: str = "admin"):
+                  observacion: str | None, quien: str = "admin",
+                  fin_manual: date | None = None, motivo_fin: str | None = None):
     """Corrige un pedido ya registrado y recalcula lo que dependa de eso.
 
     Mover la fecha de inicio corre todo el calendario del alumno, asi que
@@ -555,9 +556,13 @@ def editar_pedido(paquete_id: str, plan: dict | None, fecha_inicio: date,
     desde la pantalla: son el rastro de la operacion original.
     """
     anterior = paquete(paquete_id) or {}
-    fecha_fin = logic.fecha_fin_por_calendario(
+    # La fecha que se manda es solo la estimada: la base la recalcula con
+    # sus feriados y pausas (trigger de la migracion 024). Si se fija a
+    # mano, se guarda tal cual y la base ya no la toca.
+    fecha_fin = fin_manual or logic.fecha_fin_por_calendario(
         fecha_inicio, int(sesiones), dias_asiste,
-        int((plan or {}).get("vigencia_dias") or 30))
+        int((plan or {}).get("vigencia_dias") or 30),
+        excluir=fechas_sin_entrenar(grupo_id))
 
     cambios = {
         "fecha_inicio": fecha_inicio.isoformat(),
@@ -576,6 +581,11 @@ def editar_pedido(paquete_id: str, plan: dict | None, fecha_inicio: date,
         "medio_pago": medio_pago,
         "observacion": observacion,
     }
+    # Solo si la migracion 024 ya se corrio (la vista trae la columna) o
+    # si de verdad se pidio fijarla: asi editar no se rompe si falta.
+    if fin_manual or "fin_manual" in anterior:
+        cambios["fin_manual"] = bool(fin_manual)
+        cambios["fin_manual_motivo"] = (motivo_fin or None) if fin_manual else None
     if plan:
         cambios["plan_id"] = plan.get("id")
         cambios["plan_nombre"] = plan["nombre"]
@@ -588,11 +598,14 @@ def editar_pedido(paquete_id: str, plan: dict | None, fecha_inicio: date,
         detalle = []
         for campo, etiqueta in (("fecha_inicio", "inicio"), ("precio", "precio"),
                                 ("sesiones_totales", "sesiones"),
-                                ("plan_nombre", "plan"), ("dias_asiste", "dias")):
+                                ("plan_nombre", "plan"), ("dias_asiste", "dias"),
+                                ("fecha_fin", "fin")):
             antes = anterior.get(campo)
             ahora = cambios.get(campo)
             if ahora is not None and str(antes) != str(ahora):
                 detalle.append(f"{etiqueta}: {antes} -> {ahora}")
+        if fin_manual:
+            detalle.append(f"fin fijado a mano ({motivo_fin or 'sin motivo'})")
         if detalle:
             registrar_bloqueo(
                 anterior.get("alumno_id"),
@@ -798,6 +811,20 @@ def dias_no_laborables(desde: date | None = None) -> pd.DataFrame:
         g = r.pop("grupos", None) or {}
         r["grupo"] = g.get("nombre") or "Todos los grupos"
     return _df(rows)
+
+
+@_cache(CACHE_CORTO, entradas=16)
+def fechas_sin_entrenar(grupo_id: str | None = None) -> set:
+    """Dias sin entrenamiento que le tocan a un grupo: los de todos los
+    grupos (feriados) mas los propios. Solo para calcular vistas previas;
+    la fecha que se guarda la calcula la base con la misma regla."""
+    try:
+        rows = (_tabla("dias_no_laborables").select("fecha,grupo_id")
+                .execute().data) or []
+    except Exception:
+        return set()
+    return {logic.a_fecha(r["fecha"]) for r in rows
+            if not r.get("grupo_id") or r.get("grupo_id") == grupo_id}
 
 
 def marcar_no_laborable(fecha: date, grupo_id: str | None, motivo: str):

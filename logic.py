@@ -280,21 +280,24 @@ def es_dia_de_entrenamiento(fecha: date, dias) -> bool:
     return fecha.weekday() in dias_a_indices(dias)
 
 
-def fecha_de_sesion(inicio: date, numero: int, dias) -> date | None:
+def fecha_de_sesion(inicio: date, numero: int, dias,
+                    excluir=None) -> date | None:
     """Fecha en la que cae la sesion numero N.
 
     Cuenta desde `inicio` inclusive: si el inicio cae en un dia de
-    entrenamiento, ese dia es la sesion 1.
+    entrenamiento, ese dia es la sesion 1. `excluir` son fechas que no
+    cuentan (dias sin entrenamiento): la sesion se corre a la siguiente.
     """
     indices = dias_a_indices(dias)
     if not indices or numero < 1:
         return None
+    excluir = set(excluir or ())
 
     fecha = inicio
     contadas = 0
     # Tope de seguridad: 5 anios. Ningun plan real llega ni cerca.
     for _ in range(365 * 5):
-        if fecha.weekday() in indices:
+        if fecha.weekday() in indices and fecha not in excluir:
             contadas += 1
             if contadas == numero:
                 return fecha
@@ -303,28 +306,30 @@ def fecha_de_sesion(inicio: date, numero: int, dias) -> date | None:
 
 
 def fecha_fin_por_calendario(inicio: date, sesiones: int, dias,
-                             vigencia_dias: int | None = None) -> date:
+                             vigencia_dias: int | None = None,
+                             excluir=None) -> date:
     """Fecha de la ultima sesion del plan.
 
     Si el grupo no tiene dias definidos, cae en el metodo viejo de contar
     dias corridos, para que nada quede sin fecha de fin.
     """
-    fin = fecha_de_sesion(inicio, sesiones, dias)
+    fin = fecha_de_sesion(inicio, sesiones, dias, excluir)
     if fin:
         return fin
     return fecha_fin_plan(inicio, vigencia_dias or 30)
 
 
-def proximas_sesiones(inicio: date, cantidad: int, dias) -> list:
+def proximas_sesiones(inicio: date, cantidad: int, dias, excluir=None) -> list:
     """Las fechas exactas de las proximas N sesiones. Para mostrar el
     cronograma al alumno cuando compra."""
     indices = dias_a_indices(dias)
     if not indices or cantidad < 1:
         return []
+    excluir = set(excluir or ())
 
     fechas, fecha = [], inicio
     for _ in range(365 * 5):
-        if fecha.weekday() in indices:
+        if fecha.weekday() in indices and fecha not in excluir:
             fechas.append(fecha)
             if len(fechas) == cantidad:
                 break
@@ -344,6 +349,12 @@ def sesiones_entre(desde: date, hasta: date, dias) -> int:
             total += 1
         fecha += timedelta(days=1)
     return total
+
+
+def sesiones_txt(n) -> str:
+    """'1 sesion', '12 sesiones'. Evita el '1 sesiones' de la pantalla."""
+    n = int(n)
+    return f"{n} sesion" if n == 1 else f"{n} sesiones"
 
 
 def frecuencia(dias) -> str:
