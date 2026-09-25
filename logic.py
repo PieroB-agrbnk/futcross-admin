@@ -351,6 +351,34 @@ def sesiones_entre(desde: date, hasta: date, dias) -> int:
     return total
 
 
+def ventanas_alternas(desde: date, vuelta: date, cada_semanas: int,
+                      veces: int) -> list:
+    """Pausas que se repiten: [(inicio, vuelta), ...].
+
+    Para el alumno que trabaja en mina, una semana si y otra no: la pausa
+    del 21 al 28 se repite cada 2 semanas, del 5 al 12, del 19 al 26...
+    La vuelta es el dia que regresa, asi que ese dia ya cuenta como clase.
+    """
+    salto = timedelta(weeks=max(1, int(cada_semanas)))
+    return [(desde + salto * i, vuelta + salto * i)
+            for i in range(max(1, int(veces)))]
+
+
+def se_superpone(desde: date, vuelta: date | None, existentes) -> bool:
+    """True si la pausa [desde, vuelta) choca con alguna de las existentes.
+
+    `existentes` son pares (inicio, fin) donde fin es el dia de vuelta, o
+    None si la pausa sigue abierta sin fecha de vuelta.
+    """
+    fin_nueva = vuelta or date.max
+    for inicio, fin in existentes:
+        if inicio is None:
+            continue
+        if desde < (fin or date.max) and inicio < fin_nueva:
+            return True
+    return False
+
+
 def sesiones_txt(n) -> str:
     """'1 sesion', '12 sesiones'. Evita el '1 sesiones' de la pantalla."""
     n = int(n)

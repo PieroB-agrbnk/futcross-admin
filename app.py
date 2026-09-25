@@ -27,7 +27,7 @@ theme.aplicar_estilos()
 
 # Se muestra en la barra lateral. Sirve para saber de un vistazo si la version
 # que estas viendo en la nube es la misma que tienes en tu computadora.
-VERSION = "3.4"
+VERSION = "3.5"
 
 DIAS_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
 TURNOS = ["MANANA", "TARDE", "NOCHE"]
@@ -726,10 +726,20 @@ def pagina_alumnos() -> None:
             for col in ("Inicio del plan", "Vence", "Inscrito"):
                 vista[col] = pd.to_datetime(vista[col], errors="coerce")
 
-            # Un paquete congelado no tiene fecha de vencimiento valida: la
-            # que quedo guardada es la de antes de la pausa y se va a
-            # recalcular al reactivarlo. Mostrarla induce a error.
-            vista.loc[vista["Estado"] == "CONGELADO", "Vence"] = pd.NaT
+            # Un congelado con dia de vuelta ya tiene su fecha de fin bien
+            # calculada por la base, contando la pausa, asi que se muestra.
+            # Solo queda en blanco si la pausa no tiene dia de vuelta: ahi
+            # todavia no se puede saber cuando termina.
+            try:
+                abiertas = db.congelamientos(activos=True)
+            except Exception:
+                abiertas = pd.DataFrame()
+            sin_vuelta = set()
+            if not abiertas.empty and "fecha_alta_prevista" in abiertas.columns:
+                sin_fecha = abiertas[abiertas["fecha_alta_prevista"].isna()]
+                sin_vuelta = set(sin_fecha["paquete_id"])
+            if sin_vuelta and "paquete_id" in datos.columns:
+                vista.loc[datos["paquete_id"].isin(sin_vuelta).to_numpy(), "Vence"] = pd.NaT
 
             st.dataframe(
                 vista, width="stretch", hide_index=True, height=420,
@@ -750,9 +760,9 @@ def pagina_alumnos() -> None:
                 })
             if (vista["Estado"] == "CONGELADO").any():
                 st.caption(
-                    "Los alumnos congelados no muestran vencimiento a proposito: "
-                    "esa fecha se recalcula el dia que se les da de alta, contando "
-                    "las sesiones que les quedan."
+                    "Los congelados ya muestran su fecha de fin contando la pausa, "
+                    "y vuelven a ACTIVO solos el dia que regresan. Solo queda en "
+                    "blanco si la pausa no tiene dia de vuelta."
                 )
             descargar_csv("Descargar CSV", vista, "futcross_alumnos.csv",
                           clave="csv_alumnos")
@@ -850,16 +860,18 @@ def pagina_alumnos() -> None:
                         f"Ultima sesion el **{fecha_larga(fin_plan)}**."
                     )
 
-                # La clave del precio incluye el plan: al cambiar de plan se
-                # propone el precio del nuevo, no se queda el del anterior.
-                kp = f"{k('precio')}_{plan_elegido.get('id')}"
+                # El precio depende del plan y de la sede: se proponen el
+                # normal y el de promocion de esa sede. La clave lleva los dos,
+                # asi al cambiar de plan o de grupo se propone el que toca.
+                normal, actual = db.precio_plan(plan_elegido, db.sede_de_grupo(grupo_id))
+                kp = f"{k('precio')}_{plan_elegido.get('id')}_{grupo_id}"
                 r1, r2, r3 = st.columns(3)
                 lista_plan = r1.number_input(
                     "Precio de lista (S/)", min_value=0.0, step=10.0,
-                    value=float(plan_elegido["precio"]), key=kp + "_lista")
+                    value=float(normal), key=kp + "_lista")
                 precio_plan = r2.number_input(
                     "Precio cobrado (S/)", min_value=0.0, step=1.0,
-                    value=float(plan_elegido["precio"]), key=kp + "_cobrado",
+                    value=float(actual), key=kp + "_cobrado",
                     help="Lo que paga el cliente, con descuento si hubo")
                 medio_plan = r3.selectbox("Metodo de pago", MEDIOS_PAGO, key=k("medio"))
                 if lista_plan - precio_plan > 0:
@@ -1487,14 +1499,16 @@ def pagina_paquetes() -> None:
                 sede = None
 
                 st.markdown("**Cobro**")
+                # Precio normal y de promocion de la sede del grupo elegido
+                normal, actual = db.precio_plan(plan, db.sede_de_grupo(grupo_id))
                 e1, e2, e3 = st.columns(3)
                 precio_lista = e1.number_input(
-                    "Precio de lista (S/)", value=float(plan["precio"]),
-                    min_value=0.0, step=10.0, key=kp + "_lista",
-                    help="El del catalogo. Se completa solo con el del plan.")
+                    "Precio de lista (S/)", value=float(normal),
+                    min_value=0.0, step=10.0, key=f"{kp}_{grupo_id}_lista",
+                    help="El precio normal de esa sede. Se completa solo.")
                 precio = e2.number_input(
-                    "Precio cobrado (S/)", value=float(plan["precio"]),
-                    min_value=0.0, step=1.0, key=kp + "_cobrado",
+                    "Precio cobrado (S/)", value=float(actual),
+                    min_value=0.0, step=1.0, key=f"{kp}_{grupo_id}_cobrado",
                     help="Lo que realmente paga el cliente, con descuento si hubo")
                 medio = e3.selectbox("Metodo de pago", MEDIOS_PAGO, key=k("medio"))
 
@@ -1701,48 +1715,95 @@ def pagina_congelamientos() -> None:
     tab_nuevo, tab_activos, tab_hist = st.tabs(["Congelar", "Congelados", "Historial"])
 
     with tab_nuevo:
-        activos = db.listar_paquetes(["ACTIVO"])
+        # Tambien los congelados y los que aun no arrancan: un alumno puede
+        # necesitar varias pausas, como el que trabaja en mina una semana si
+        # y otra no. Lo que no se permite es que una pausa pise a otra.
+        activos = db.listar_paquetes(["ACTIVO", "CONGELADO", "POR EMPEZAR"])
         if activos.empty:
-            st.info("No hay paquetes activos para congelar.")
+            st.info("No hay paquetes vigentes para congelar.")
         else:
+            mostrar_aviso("congelar")
             etiquetas = {
-                f"{r['codigo']} · {r['alumno']} — {r['plan_nombre']} "
-                f"({r['sesiones_restantes']} sesiones, vence {logic.a_fecha(r['fecha_fin']).strftime('%d/%m')})":
+                f"{r['codigo']} · {r['alumno']} · {r['plan_nombre']} "
+                f"({r['sesiones_restantes']} sesiones, {str(r['estado_real']).lower()})":
                     (r["id"], r["alumno_id"])
                 for _, r in activos.iterrows()
             }
-            elegido = st.selectbox("Paquete", list(etiquetas.keys()))
+            elegido = st.selectbox("Paquete", list(etiquetas.keys()), key="cong_paquete")
             paquete_id, alumno_id = etiquetas[elegido]
 
-            with st.form("form_congelar"):
+            def k(nombre):
+                return f"cong_{paquete_id}_{nombre}_{st.session_state.get('cong_v', 0)}"
+
+            with st.container(border=True):
                 c1, c2 = st.columns(2)
-                motivo = c1.selectbox("Motivo",
-                                      ["LESION", "ENFERMEDAD", "VIAJE", "TRABAJO", "OTRO"])
-                desde = c2.date_input("Congelar desde", value=logic.hoy(), format="DD/MM/YYYY")
+                motivo = c1.selectbox("Motivo", ["LESION", "ENFERMEDAD", "VIAJE",
+                                                 "TRABAJO", "OTRO"], key=k("motivo"))
+                desde = c2.date_input("Congelar desde", value=logic.hoy(),
+                                      format="DD/MM/YYYY", key=k("desde"))
                 detalle = st.text_input(
-                    "Detalle", placeholder="Ej. esguince de tobillo, 3 semanas de reposo")
+                    "Detalle", key=k("detalle"),
+                    placeholder="Ej. esguince de tobillo, 3 semanas de reposo")
 
                 d1, d2 = st.columns([1, 2])
-                sabe_cuando = d1.checkbox("Ya se cuando vuelve", value=True)
+                sabe_cuando = d1.checkbox("Ya se cuando vuelve", value=True,
+                                          key=k("sabe"))
+                # Una semana por defecto: es lo mas comun (viaje, trabajo). La
+                # clave lleva la fecha de inicio para que la vuelta la siga.
                 alta_prevista = d2.date_input(
-                    "Fecha prevista de alta", value=desde + timedelta(days=30),
-                    min_value=desde, format="DD/MM/YYYY", disabled=not sabe_cuando,
-                    help="Es una estimacion. La fecha real se confirma al reactivar.")
+                    "Dia que vuelve", value=desde + timedelta(days=7),
+                    min_value=desde + timedelta(days=1), format="DD/MM/YYYY",
+                    disabled=not sabe_cuando, key=k(f"vuelta_{desde}"),
+                    help="El dia que regresa a entrenar. Ese dia ya cuenta como clase.")
 
-                if st.form_submit_button("Congelar paquete", type="primary"):
-                    try:
-                        db.congelar(paquete_id, alumno_id, motivo, detalle, desde,
-                                    alta_prevista if sabe_cuando else None)
-                        st.toast("Paquete congelado", icon="❄️")
-                        aviso = ("Paquete congelado. No se le descontaran "
-                                 "sesiones hasta que lo reactives.")
-                        if sabe_cuando:
-                            aviso += (" Se espera su vuelta el "
-                                      f"{fecha_larga(alta_prevista)}.")
-                        st.success(aviso)
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"No se pudo congelar: {e}")
+                repetir = False
+                ventanas = [(desde, alta_prevista if sabe_cuando else None)]
+                if sabe_cuando:
+                    repetir = st.checkbox(
+                        "Se repite (por ejemplo, una semana si y otra no)", key=k("repetir"),
+                        help="Para quien trabaja por turnos fuera de Lima")
+                    if repetir:
+                        r1, r2 = st.columns(2)
+                        cada = r1.number_input("Cada cuantas semanas", min_value=1,
+                                               max_value=8, value=2, key=k("cada"))
+                        veces = r2.number_input("Cuantas veces en total", min_value=2,
+                                                max_value=12, value=3, key=k("veces"))
+                        ventanas = logic.ventanas_alternas(desde, alta_prevista,
+                                                           int(cada), int(veces))
+                        st.caption("Pausas que se van a registrar: " + " · ".join(
+                            f"{a.strftime('%d/%m')} al {(b - timedelta(days=1)).strftime('%d/%m')}"
+                            for a, b in ventanas))
+
+                if st.button("Congelar", type="primary", key=k("guardar")):
+                    existentes = db.pausas_de(paquete_id)
+                    choques = [a for a, b in ventanas
+                               if logic.se_superpone(a, b, existentes)]
+                    if choques:
+                        st.error(
+                            "Esa pausa se cruza con otra que ya tiene "
+                            f"(desde el {choques[0].strftime('%d/%m')}). Revisa sus "
+                            "pausas en la pestana Congelados: si una no tiene fecha "
+                            "de vuelta, ponsela primero.")
+                    else:
+                        try:
+                            for a, b in ventanas:
+                                db.congelar(paquete_id, alumno_id, motivo, detalle, a, b)
+                            st.toast("Pausa registrada", icon="\u2744\ufe0f")
+                            if len(ventanas) > 1:
+                                aviso = (f"Se registraron {len(ventanas)} pausas. Se "
+                                         "congela y reactiva solo en cada fecha.")
+                            elif sabe_cuando:
+                                aviso = (f"Pausa registrada. Vuelve el "
+                                         f"{fecha_larga(alta_prevista)} y ese dia se "
+                                         "reactiva solo.")
+                            else:
+                                aviso = ("Pausa registrada sin fecha de vuelta. "
+                                         "Reactivalo en Congelados cuando regrese.")
+                            avisar(aviso, "congelar")
+                            st.session_state["cong_v"] = st.session_state.get("cong_v", 0) + 1
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"No se pudo congelar: {e}")
 
     with tab_activos:
         cong = db.congelamientos(activos=True)
@@ -1782,21 +1843,43 @@ def pagina_congelamientos() -> None:
                         c2.metric("Congelado desde", inicio.strftime("%d/%m/%Y"),
                                   f"{dias} dias")
                     # Se propone la fecha que se habia estimado al congelar
-                    por_defecto = prevista if prevista and prevista >= inicio \
-                        else max(inicio, logic.hoy())
-                    alta = c3.date_input("Fecha de alta", value=por_defecto,
-                                         min_value=inicio, format="DD/MM/YYYY",
-                                         key=f"alta_{c['id']}")
-                    if c3.button("Reactivar", key=f"react_{c['id']}",
-                                 type="primary", width="stretch"):
+                    por_defecto = prevista if prevista and prevista > inicio \
+                        else max(inicio + timedelta(days=1), logic.hoy())
+                    alta = c3.date_input("Dia que vuelve", value=por_defecto,
+                                         min_value=inicio + timedelta(days=1),
+                                         format="DD/MM/YYYY", key=f"alta_{c['id']}")
+                    # Una vuelta futura se guarda y la base lo reactiva ese dia.
+                    # Antes, apretar Reactivar con una fecha futura lo
+                    # reactivaba hoy mismo.
+                    if alta > logic.hoy():
+                        if c3.button("Guardar dia de vuelta", key=f"vuelta_{c['id']}",
+                                     type="primary", width="stretch"):
+                            try:
+                                db.cambiar_vuelta(c["id"], alta)
+                                st.toast("Dia de vuelta actualizado", icon="\u2705")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"No se pudo guardar: {e}")
+                    elif c3.button("Reactivar", key=f"react_{c['id']}",
+                                   type="primary", width="stretch"):
                         try:
                             d = db.reactivar(c["id"], alta)
-                            st.toast(f"Reactivado, +{d} dias de vigencia", icon="✅")
-                            st.success(f"Alumno reactivado. Se sumaron {d} dias "
-                                       "a la vigencia del paquete.")
+                            st.toast("Alumno reactivado", icon="\u2705")
                             st.rerun()
                         except Exception as e:
                             st.error(f"No se pudo reactivar: {e}")
+                    # Una pausa programada que todavia no empieza se puede quitar,
+                    # por si se registro mal
+                    if aun_no_empieza and c3.button("Quitar esta pausa",
+                                                    key=f"quitar_{c['id']}",
+                                                    width="stretch"):
+                        try:
+                            db.quitar_pausa(c["id"])
+                            st.toast("Pausa quitada", icon="\u2705")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"No se pudo quitar: {e}")
+
 
     with tab_hist:
         hist = db.congelamientos(activos=None)
@@ -2025,13 +2108,88 @@ def pagina_reportes() -> None:
 # =====================================================================
 # 8. PLANES
 # =====================================================================
+def precios_por_sede(planes: pd.DataFrame) -> None:
+    """Precio normal y precio actual de cada plan, sede por sede.
+
+    Es lo que se propone solo al vender segun el grupo elegido. Cuando
+    termina una promocion, se cambia aca y listo: no hay que tocar nada mas.
+    """
+    mostrar_aviso("precios")
+    activos = planes[planes["activo"].astype(bool)] if not planes.empty else planes
+    grupos = db.listar_grupos()
+    if activos.empty or grupos.empty:
+        theme.vacio("Faltan planes o grupos", "Crea primero los planes y los grupos.")
+        return
+
+    sedes = sorted(grupos["sede"].dropna().unique().tolist())
+    sede = st.radio("Sede", sedes, horizontal=True, key="precios_sede")
+    st.caption(
+        "El precio normal es el tachado del flyer y el actual es el que se cobra. "
+        "La diferencia aparece sola como descuento en los reportes. Deja un plan "
+        "sin precio si en esa sede no se vende: se usara el del catalogo."
+    )
+
+    tabla = db.precios_sede()
+    filas = []
+    for _, pl in activos.sort_values("sesiones").iterrows():
+        propio = pd.DataFrame()
+        if not tabla.empty:
+            propio = tabla[(tabla["plan_id"] == pl["id"]) & (tabla["sede"] == sede)]
+        tiene = not propio.empty
+        filas.append({
+            "plan_id": pl["id"],
+            "Plan": pl["nombre"],
+            "Sesiones": int(pl["sesiones"]),
+            "Se vende aca": tiene,
+            "Precio normal": float(propio.iloc[0]["precio_lista"]) if tiene else float(pl["precio"] or 0),
+            "Precio actual": float(propio.iloc[0]["precio"]) if tiene else float(pl["precio"] or 0),
+        })
+    editado = st.data_editor(
+        pd.DataFrame(filas), hide_index=True, width="stretch", key=f"editor_{sede}",
+        disabled=["plan_id", "Plan", "Sesiones"],
+        column_config={
+            "plan_id": None,
+            "Se vende aca": st.column_config.CheckboxColumn(
+                "Se vende aca", help="Desmarcado usa el precio del catalogo"),
+            "Precio normal": st.column_config.NumberColumn(
+                "Precio normal", format="S/ %.2f", min_value=0.0),
+            "Precio actual": st.column_config.NumberColumn(
+                "Precio actual", format="S/ %.2f", min_value=0.0),
+        })
+
+    if st.button("Guardar precios de " + sede.title(), type="primary",
+                 key=f"guardar_precios_{sede}"):
+        malos = editado[editado["Se vende aca"] &
+                        (editado["Precio actual"] > editado["Precio normal"])]
+        if not malos.empty:
+            st.error("El precio actual no puede ser mayor al normal en: "
+                     + ", ".join(malos["Plan"]))
+        else:
+            try:
+                for _, f in editado.iterrows():
+                    if bool(f["Se vende aca"]):
+                        db.guardar_precio(f["plan_id"], sede, float(f["Precio normal"]),
+                                          float(f["Precio actual"]))
+                    else:
+                        db.quitar_precio(f["plan_id"], sede)
+                st.toast("Precios guardados", icon="\u2705")
+                avisar(f"Precios de {sede.title()} guardados.", "precios")
+                st.rerun()
+            except Exception as e:
+                st.error(f"No se pudieron guardar: {e}")
+
+
 def pagina_planes() -> None:
     theme.cabecera("Planes", fecha_larga(logic.hoy()).upper(), "Catalogo y precios")
 
     planes = db.listar_planes(solo_activos=False)
 
-    tab_lista, tab_editar, tab_nuevo = st.tabs(
-        ["Catalogo", "Editar un plan", "Crear plan"])
+    tab_lista, tab_precios, tab_editar, tab_nuevo = st.tabs(
+        ["Catalogo", "Precios por sede", "Editar un plan", "Crear plan"])
+
+    # -------------------------------------------------- precios por sede
+    with tab_precios:
+        precios_por_sede(planes)
 
     # ---------------------------------------------------------- catalogo
     with tab_lista:

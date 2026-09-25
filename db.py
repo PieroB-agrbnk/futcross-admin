@@ -166,6 +166,63 @@ def actualizar_plan(plan_id: str, cambios: dict):
 
 
 # ---------------------------------------------------------------------
+# Precios por sede
+#
+# El mismo plan cuesta distinto segun la sede, y cada precio tiene su
+# normal (el tachado del flyer) y el de promocion. Al vender se proponen
+# los dos: el normal como precio de lista y el otro como cobrado.
+# ---------------------------------------------------------------------
+@_cache(CACHE_LARGO)
+def precios_sede() -> pd.DataFrame:
+    try:
+        return _df(_tabla("precios_sede").select("*").execute().data)
+    except Exception:
+        # La migracion 025 todavia no se corrio
+        return pd.DataFrame()
+
+
+def precio_plan(plan: dict, sede: str | None) -> tuple[float, float]:
+    """(precio de lista, precio actual) de un plan en una sede.
+
+    Si esa sede no tiene precio propio, se usa el del catalogo para los dos.
+    """
+    base = float(plan.get("precio") or 0)
+    tabla = precios_sede()
+    if sede and not tabla.empty:
+        fila = tabla[(tabla["plan_id"] == plan.get("id")) & (tabla["sede"] == sede)]
+        if not fila.empty:
+            return float(fila.iloc[0]["precio_lista"]), float(fila.iloc[0]["precio"])
+    return base, base
+
+
+def guardar_precio(plan_id: str, sede: str, precio_lista: float, precio: float):
+    r = _tabla("precios_sede").upsert({
+        "plan_id": plan_id,
+        "sede": sede,
+        "precio_lista": float(precio_lista),
+        "precio": float(precio),
+        "actualizado_en": datetime.now(timezone.utc).isoformat(),
+    }, on_conflict="plan_id,sede").execute().data
+    invalidar_cache()
+    return r
+
+
+def quitar_precio(plan_id: str, sede: str):
+    _tabla("precios_sede").delete().eq("plan_id", plan_id).eq("sede", sede).execute()
+    invalidar_cache()
+
+
+def sede_de_grupo(grupo_id: str | None) -> str | None:
+    if not grupo_id:
+        return None
+    grupos = listar_grupos()
+    if grupos.empty:
+        return None
+    fila = grupos[grupos["id"] == grupo_id]
+    return None if fila.empty else fila.iloc[0]["sede"]
+
+
+# ---------------------------------------------------------------------
 # Configuracion (claves de acceso)
 #
 # Sin cache a proposito: si se cambia un PIN, tiene que valer al
@@ -784,6 +841,38 @@ def congelados_que_vuelven(hasta: date) -> pd.DataFrame:
         r["alumno"] = f"{a.get('nombres','')} {a.get('apellidos','')}".strip()
         r["telefono"] = a.get("telefono")
     return _df(rows)
+
+
+def pausas_de(paquete_id: str) -> list:
+    """Las pausas de un paquete como pares (inicio, dia de vuelta).
+
+    Sirve para no registrar una pausa encima de otra. La vuelta es la real
+    si ya se reactivo, la prevista si no, o None si sigue abierta sin fecha.
+    """
+    rows = (_tabla("congelamientos").select("fecha_inicio,fecha_fin,fecha_alta_prevista")
+            .eq("paquete_id", paquete_id).execute().data) or []
+    return [(logic.a_fecha(r["fecha_inicio"]),
+             logic.a_fecha(r.get("fecha_fin")) or logic.a_fecha(r.get("fecha_alta_prevista")))
+            for r in rows]
+
+
+def cambiar_vuelta(congelamiento_id: str, vuelta: date) -> None:
+    """Cambia el dia en que el alumno vuelve, sin reactivarlo hoy.
+
+    La base recalcula su fecha de fin con la nueva vuelta, y ese dia lo
+    reactiva sola (de noche, o al abrir el panel).
+    """
+    _tabla("congelamientos").update({
+        "fecha_alta_prevista": vuelta.isoformat(),
+    }).eq("id", congelamiento_id).execute()
+    invalidar_cache()
+
+
+def quitar_pausa(congelamiento_id: str) -> None:
+    """Borra una pausa programada que todavia no empezo. La base vuelve a
+    calcular la fecha de fin sin ella."""
+    _tabla("congelamientos").delete().eq("id", congelamiento_id).execute()
+    invalidar_cache()
 
 
 def congelamiento_abierto(paquete_id: str) -> dict | None:
