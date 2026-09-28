@@ -27,7 +27,7 @@ theme.aplicar_estilos()
 
 # Se muestra en la barra lateral. Sirve para saber de un vistazo si la version
 # que estas viendo en la nube es la misma que tienes en tu computadora.
-VERSION = "3.6"
+VERSION = "3.7"
 
 DIAS_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
 TURNOS = ["MANANA", "TARDE", "NOCHE"]
@@ -398,9 +398,18 @@ def procesar_marca(fila: dict) -> None:
         "SIN_PAQUETE": "Sin plan",
     }.get(motivo, "Revisar en recepcion")
 
+    # Sede, horario y dias, para que el profe sepa al toque de que grupo es
+    def _dato(c):
+        v = fila.get(c)
+        return "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v)
+    detalle = " · ".join(x for x in (_dato("sede"), _dato("hora")) if x)
+    if _dato("dias_asiste"):
+        detalle += (" · " if detalle else "") + f"Sus dias: {_dato('dias_asiste')}"
+
     st.session_state["kiosco"] = {
         "html": theme.tarjeta_resultado(nombre, codigo, veredicto, mensaje,
-                                     autorizado, usadas, totales, vence),
+                                     autorizado, usadas, totales, vence,
+                                     detalle=detalle or None),
         "hora": logic.ahora_hhmm(),
     }
     st.session_state["candidatos"] = []
@@ -409,77 +418,204 @@ def procesar_marca(fila: dict) -> None:
 def pagina_checkin() -> None:
     hoy = logic.hoy()
     theme.cabecera("Marcar asistencia", fecha_larga(hoy).upper(), "Recepcion")
-    st.caption(
-        "Esta pantalla es el respaldo de recepcion: sirve para marcar a mano cuando "
-        "el alumno no pudo usar la tablet de la cancha."
-    )
 
-    izq, der = st.columns([1, 1.15], gap="large")
+    tab_lista, tab_uno = st.tabs(["Pasar lista por grupo", "Uno por uno"])
+    with tab_lista:
+        pasar_lista()
+    with tab_uno:
+        marcar_uno_por_uno(hoy)
 
-    with izq:
-        with st.form("form_checkin", clear_on_submit=True):
-            texto = st.text_input(
-                "Escribe tu DNI, tu codigo (FC-0001) o tu nombre",
-                placeholder="Ej. 45678912",
-                label_visibility="visible",
-            )
-            enviado = st.form_submit_button("Marcar asistencia", type="primary",
-                                            width="stretch")
-
-        if enviado:
-            st.session_state["kiosco"] = None
-            candidatos = db.identificar(texto)
-            if not candidatos:
-                db.registrar_bloqueo(None, texto, "NO_ENCONTRADO")
-                st.session_state["candidatos"] = []
-                st.session_state["kiosco"] = {
-                    "html": theme.tarjeta_resultado(
-                        "No te encontramos", texto.upper(), "Sin registro",
-                        "Ese dato no figura en el sistema. Acercate a recepcion para inscribirte.",
-                        autorizado=False),
-                    "hora": logic.ahora_hhmm(),
-                }
-            elif len(candidatos) == 1:
-                procesar_marca(candidatos[0])
-            else:
-                st.session_state["candidatos"] = candidatos
-
-        for c in st.session_state.get("candidatos", []) or []:
-            etiqueta = f"{c['codigo']} · {c.get('alumno','')}"
-            if st.button(etiqueta, key=f"cand_{c['alumno_id']}", width="stretch"):
-                procesar_marca(c)
-                st.rerun()
-
-        st.caption(
-            "El plan corre por calendario: las sesiones se cuentan desde el dia "
-            "que arranca, vaya o no vaya el alumno. Marcar aca no descuenta "
-            "nada, solo deja registro de quien vino."
-        )
-
-    with der:
-        res = st.session_state.get("kiosco")
-        if res:
-            st.markdown(res["html"], unsafe_allow_html=True)
-            st.caption(f"Registrado a las {res['hora']}")
-        else:
-            st.markdown(
-                '<div class="resultado"><div class="cod">Esperando</div>'
-                '<h2>Listo para marcar</h2>'
-                '<div class="det">Escribe el DNI del alumno a la izquierda y presiona '
-                '<b>Marcar asistencia</b>.</div></div>',
-                unsafe_allow_html=True)
-
+    # Lo de hoy, filtrable por sede para contar rapido al final de la clase
     hoy_df = db.asistencias(hoy, hoy)
     st.divider()
-    st.subheader(f"Ya entrenaron hoy · {len(hoy_df)}")
     if hoy_df.empty:
+        st.subheader("Ya entrenaron hoy · 0")
         theme.vacio("Nadie ha marcado hoy",
                     "Las asistencias del dia van a ir apareciendo aca.")
-    else:
-        st.dataframe(
-            hoy_df[["hora", "codigo", "alumno"]].rename(
-                columns={"hora": "Hora", "codigo": "Codigo", "alumno": "Alumno"}),
-            width="stretch", hide_index=True, height=260)
+        return
+    sedes = sorted(s for s in hoy_df["sede"].dropna().unique() if s) \
+        if "sede" in hoy_df.columns else []
+    filtro = "Todas"
+    if len(sedes) > 1:
+        filtro = st.selectbox("Sede", ["Todas"] + sedes, key="hoy_sede")
+    vista = hoy_df if filtro == "Todas" else hoy_df[hoy_df["sede"] == filtro]
+    st.subheader(f"Ya entrenaron hoy · {len(vista)}")
+    columnas = [c for c in ("hora", "codigo", "alumno", "sede") if c in vista.columns]
+    st.dataframe(
+        vista[columnas].rename(columns={"hora": "Hora", "codigo": "Codigo",
+                                        "alumno": "Alumno", "sede": "Sede"}),
+        width="stretch", hide_index=True, height=260)
+
+
+def pasar_lista() -> None:
+    """El profe elige su grupo y marca de una vez a todos los que vinieron.
+
+    Antes habia que buscar alumno por alumno. Ahora aparecen los que les toca
+    entrenar ese dia en ese grupo, con cuantos faltan por marcar, y se
+    guardan todos con un boton.
+    """
+    hoy = logic.hoy()
+    mostrar_aviso("lista")
+    grupos = db.listar_grupos()
+    if grupos.empty:
+        theme.vacio("No hay grupos", "Crea los grupos primero.")
+        return
+
+    opciones = {f"{g['sede']} · {g['hora']} ({g['dias']})": g
+                for _, g in grupos.iterrows()}
+    llaves = list(opciones)
+    # Se propone el grupo que entrena hoy
+    sugerido = next((i for i, k in enumerate(llaves)
+                     if hoy.weekday() in logic.dias_a_indices(opciones[k]["dias"])), 0)
+    c1, c2 = st.columns([2, 1])
+    elegido = c1.selectbox("Grupo", llaves, index=sugerido, key="lista_grupo")
+    g = opciones[elegido]
+    fecha = c2.date_input("Fecha", value=hoy, max_value=hoy,
+                          min_value=hoy - timedelta(days=7), format="DD/MM/YYYY",
+                          key="lista_fecha",
+                          help="Hasta una semana atras, por si se paso la lista tarde")
+
+    alumnos = db.panel_alumnos()
+    del_grupo = alumnos[alumnos["grupo_id"] == g["id"]] if not alumnos.empty \
+        and "grupo_id" in alumnos.columns else pd.DataFrame()
+    if del_grupo.empty:
+        theme.vacio("Este grupo no tiene alumnos", "Inscribelos en la pantalla Alumnos.")
+        return
+
+    asis = db.asistencias(fecha, fecha)
+    ya = set(asis["alumno_id"]) if not asis.empty else set()
+
+    filas = []
+    for _, a in del_grupo.iterrows():
+        dias = a.get("dias_asiste")
+        dias = "" if dias is None or (isinstance(dias, float) and pd.isna(dias)) else str(dias)
+        toca = logic.es_dia_de_entrenamiento(fecha, dias)
+        activo = a.get("estado_real") == "ACTIVO"
+        restantes = a.get("sesiones_restantes")
+        filas.append({
+            "alumno_id": a["alumno_id"], "paquete_id": a.get("paquete_id"),
+            "toca": toca and activo, "activo": activo, "ya": a["alumno_id"] in ya,
+            "Alumno": a["alumno"], "Dias": dias,
+            "Quedan": None if pd.isna(restantes) else int(restantes),
+            "Estado": ("Ya marcado" if a["alumno_id"] in ya
+                       else "Le toca hoy" if toca and activo
+                       else "Otro dia" if activo
+                       else str(a.get("estado_real") or "").title()),
+        })
+    tabla = pd.DataFrame(filas)
+    tabla = tabla.sort_values(["toca", "Alumno"], ascending=[False, True])
+
+    esperados = int(tabla["toca"].sum())
+    marcados = int((tabla["toca"] & tabla["ya"]).sum())
+    theme.kpis([
+        ("Les toca", esperados, fecha_larga(fecha), "naranja"),
+        ("Ya marcados", marcados, "de los que les toca", "verde"),
+        ("Faltan", esperados - marcados, "por marcar",
+         "ambar" if esperados - marcados else "verde"),
+    ])
+
+    todos = st.toggle("Empezar con todos los que les toca ya marcados",
+                      key="lista_todos",
+                      help="Marca a todos y desmarca a los que faltaron")
+    tabla["Vino"] = tabla["ya"] | (tabla["toca"] & todos)
+    editado = st.data_editor(
+        tabla[["Vino", "Alumno", "Dias", "Quedan", "Estado",
+               "alumno_id", "paquete_id", "activo", "ya"]],
+        hide_index=True, width="stretch",
+        key=f"lista_{g['id']}_{fecha}_{todos}_{st.session_state.get('lista_v', 0)}",
+        disabled=["Alumno", "Dias", "Quedan", "Estado"],
+        column_config={
+            "Vino": st.column_config.CheckboxColumn("Vino"),
+            "Quedan": st.column_config.NumberColumn("Quedan", help="Clases que le quedan"),
+            "alumno_id": None, "paquete_id": None, "activo": None, "ya": None,
+        })
+
+    nuevos = editado[editado["Vino"] & ~editado["ya"]]
+    if st.button(f"Guardar lista ({len(nuevos)} por registrar)", type="primary",
+                 disabled=nuevos.empty, key="lista_guardar", width="stretch"):
+        hechos, sin_plan = 0, []
+        for _, f in nuevos.iterrows():
+            if not f["activo"] or pd.isna(f["paquete_id"]) or not f["paquete_id"]:
+                sin_plan.append(f["Alumno"])
+                continue
+            try:
+                db.marcar_asistencia(f["alumno_id"], f["paquete_id"], sede=g["sede"],
+                                     origen="LISTA",
+                                     fecha=None if fecha == hoy else fecha)
+                hechos += 1
+            except Exception as e:
+                if "uq_asistencia_dia" not in str(e) and "duplicate" not in str(e).lower():
+                    st.error(f"No se pudo marcar a {f['Alumno']}: {e}")
+        aviso = f"Lista guardada: {hechos} asistencias registradas."
+        if sin_plan:
+            aviso += (" No se marco a " + ", ".join(sin_plan) +
+                      " porque su plan no esta vigente: que pase por recepcion.")
+        st.toast(f"{hechos} asistencias registradas", icon="\u2705")
+        avisar(aviso, "lista")
+        st.session_state["lista_v"] = st.session_state.get("lista_v", 0) + 1
+        st.rerun()
+
+
+def marcar_uno_por_uno(hoy) -> None:
+    # En celular las columnas se apilan: la clave del contenedor permite
+    # que el resultado quede arriba del buscador y no haya que bajar.
+    with st.container(key="checkin"):
+        izq, der = st.columns([1, 1.15], gap="large")
+
+        with izq:
+            with st.form("form_checkin", clear_on_submit=True):
+                texto = st.text_input(
+                    "Escribe tu DNI, tu codigo (FC-0001) o tu nombre",
+                    placeholder="Ej. 45678912",
+                    label_visibility="visible",
+                )
+                enviado = st.form_submit_button("Marcar asistencia", type="primary",
+                                                width="stretch")
+
+            if enviado:
+                st.session_state["kiosco"] = None
+                candidatos = db.identificar(texto)
+                if not candidatos:
+                    db.registrar_bloqueo(None, texto, "NO_ENCONTRADO")
+                    st.session_state["candidatos"] = []
+                    st.session_state["kiosco"] = {
+                        "html": theme.tarjeta_resultado(
+                            "No te encontramos", texto.upper(), "Sin registro",
+                            "Ese dato no figura en el sistema. Acercate a recepcion "
+                            "para inscribirte.", autorizado=False),
+                        "hora": logic.ahora_hhmm(),
+                    }
+                elif len(candidatos) == 1:
+                    procesar_marca(candidatos[0])
+                else:
+                    st.session_state["candidatos"] = candidatos
+
+            for c in st.session_state.get("candidatos", []) or []:
+                etiqueta = f"{c['codigo']} · {c.get('alumno', '')}"
+                if c.get("sede"):
+                    etiqueta += f" · {c['sede']}"
+                if st.button(etiqueta, key=f"cand_{c['alumno_id']}", width="stretch"):
+                    procesar_marca(c)
+                    st.rerun()
+
+            st.caption(
+                "El plan corre por calendario: las sesiones se cuentan desde el dia "
+                "que arranca, vaya o no vaya el alumno. Marcar aca no descuenta "
+                "nada, solo deja registro de quien vino."
+            )
+
+        with der:
+            res = st.session_state.get("kiosco")
+            if res:
+                st.markdown(res["html"], unsafe_allow_html=True)
+                st.caption(f"Registrado a las {res['hora']}")
+            else:
+                st.markdown(
+                    '<div class="resultado espera"><div class="cod">Esperando</div>'
+                    '<h2>Listo para marcar</h2>'
+                    '<div class="det">Escribe el DNI del alumno y presiona '
+                    '<b>Marcar asistencia</b>.</div></div>',
+                    unsafe_allow_html=True)
 
 
 # =====================================================================

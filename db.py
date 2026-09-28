@@ -968,7 +968,16 @@ def marcar_asistencia(alumno_id: str, paquete_id: str, sede: str | None = None,
     }
     if fecha:
         payload["fecha"] = fecha.isoformat()
-    r = _tabla("asistencias").insert(payload).execute().data
+    try:
+        r = _tabla("asistencias").insert(payload).execute().data
+    except Exception as e:
+        # Si la base no conoce el origen nuevo (el pase de lista usa
+        # "LISTA"), se guarda con el de siempre en vez de perder la marca
+        if "origen" in str(e) and payload["origen"] != "KIOSCO":
+            payload["origen"] = "KIOSCO"
+            r = _tabla("asistencias").insert(payload).execute().data
+        else:
+            raise
     invalidar_cache()
     return r
 

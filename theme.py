@@ -220,6 +220,10 @@ section[data-testid="stSidebar"] .stButton > button[kind="primary"] p {{ color: 
 .resultado .vered.ok {{ color: #4ADE80; }}
 .resultado .vered.no {{ color: #FF7A7A; }}
 .resultado .det {{ font-size: .95rem; color: #C4C9CF; }}
+.resultado .grupo {{
+    font-size: .78rem; letter-spacing: .08em; text-transform: uppercase;
+    color: {BRASA}; margin-top: .35rem;
+}}
 
 /* ------------------------------- el marcador: una marca por sesion */
 .marcador {{ display: flex; align-items: flex-end; gap: 1rem; margin: 1.1rem 0 .4rem; }}
@@ -361,6 +365,30 @@ section[data-testid="stSidebar"] .stButton > button[kind="primary"] p {{ color: 
     background: #fff; border-radius: 3px; text-align: left;
     font-size: .82rem; color: #4B5158;
 }}
+/* ----------------------------------------------------------- celular */
+/* Los botones Fork y GitHub de Streamlit Cloud no tienen nada que ver con
+   la academia. Se ocultan, pero NO el boton que abre el menu lateral. */
+[data-testid="stToolbarActions"], [data-testid="stMainMenu"] {{ display: none !important; }}
+
+@media (max-width: 640px) {{
+    .block-container {{ padding: 1rem .9rem 3rem; }}
+    .encabezado {{ flex-direction: column; align-items: flex-start; gap: .2rem;
+                   margin-bottom: 1rem; }}
+    .encabezado h1 {{ font-size: 1.75rem; overflow-wrap: normal; word-break: keep-all;
+                      hyphens: none; }}
+    .encabezado .fecha {{ font-size: .85rem; white-space: normal; padding: 0; }}
+    .kpi {{ min-width: 30%; padding: .55rem .6rem .7rem; }}
+    .kpi .val {{ font-size: 1.8rem; }}
+    .kpi .nota {{ display: none; }}
+    .resultado {{ padding: 1.1rem 1.1rem 1.2rem; }}
+    .resultado h2 {{ font-size: 1.6rem; }}
+    .resultado .vered {{ font-size: 1.25rem; margin-top: .6rem; }}
+    .marcador .num {{ font-size: 3.1rem; }}
+    .fila {{ padding: .55rem .7rem; gap: .6rem; }}
+    /* El resultado del alumno arriba del buscador, y sin la tarjeta vacia */
+    .st-key-checkin [data-testid="stHorizontalBlock"] {{ flex-direction: column-reverse; }}
+    .resultado.espera {{ display: none; }}
+}}
 </style>
 """
 
@@ -494,12 +522,17 @@ def marcador_html(usadas: int, totales: int, marcar_hoy: bool = False) -> str:
 
 def tarjeta_resultado(nombre: str, codigo: str, veredicto: str, mensaje: str,
                       autorizado: bool, usadas: int | None = None,
-                      totales: int | None = None, vence: str | None = None) -> str:
+                      totales: int | None = None, vence: str | None = None,
+                      detalle: str | None = None) -> str:
     clase = "ok" if autorizado else "no"
     partes = [
         f'<div class="resultado {clase}">',
         f'<div class="cod">{esc(codigo)}</div>',
         f'<h2>{esc(nombre)}</h2>',
+    ]
+    if detalle:
+        partes.append(f'<div class="grupo">{esc(detalle)}</div>')
+    partes += [
         f'<div class="vered {clase}">{esc(veredicto)}</div>',
         f'<div class="det">{esc(mensaje)}</div>',
     ]
