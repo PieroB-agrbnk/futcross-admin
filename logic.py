@@ -280,16 +280,30 @@ def es_dia_de_entrenamiento(fecha: date, dias) -> bool:
     return fecha.weekday() in dias_a_indices(dias)
 
 
+def dias_en(fecha: date, dias, historial=None):
+    """Los dias que rigen para un plan en una fecha.
+
+    `historial` son pares (hasta, dias_anteriores): antes de `hasta` el plan
+    entrenaba con esos dias. Asi un cambio de horario del grupo (Surco
+    dejo los lunes en octubre) no cambia lo que ya se entreno.
+    """
+    for hasta, anteriores in sorted(historial or (), key=lambda h: h[0]):
+        if fecha < hasta:
+            return anteriores
+    return dias
+
+
 def fecha_de_sesion(inicio: date, numero: int, dias,
-                    excluir=None) -> date | None:
+                    excluir=None, historial=None) -> date | None:
     """Fecha en la que cae la sesion numero N.
 
     Cuenta desde `inicio` inclusive: si el inicio cae en un dia de
     entrenamiento, ese dia es la sesion 1. `excluir` son fechas que no
     cuentan (dias sin entrenamiento): la sesion se corre a la siguiente.
     """
-    indices = dias_a_indices(dias)
-    if not indices or numero < 1:
+    if not dias_a_indices(dias) and not historial:
+        return None
+    if numero < 1:
         return None
     excluir = set(excluir or ())
 
@@ -297,6 +311,7 @@ def fecha_de_sesion(inicio: date, numero: int, dias,
     contadas = 0
     # Tope de seguridad: 5 anios. Ningun plan real llega ni cerca.
     for _ in range(365 * 5):
+        indices = dias_a_indices(dias_en(fecha, dias, historial))
         if fecha.weekday() in indices and fecha not in excluir:
             contadas += 1
             if contadas == numero:
@@ -307,28 +322,29 @@ def fecha_de_sesion(inicio: date, numero: int, dias,
 
 def fecha_fin_por_calendario(inicio: date, sesiones: int, dias,
                              vigencia_dias: int | None = None,
-                             excluir=None) -> date:
+                             excluir=None, historial=None) -> date:
     """Fecha de la ultima sesion del plan.
 
     Si el grupo no tiene dias definidos, cae en el metodo viejo de contar
     dias corridos, para que nada quede sin fecha de fin.
     """
-    fin = fecha_de_sesion(inicio, sesiones, dias, excluir)
+    fin = fecha_de_sesion(inicio, sesiones, dias, excluir, historial)
     if fin:
         return fin
     return fecha_fin_plan(inicio, vigencia_dias or 30)
 
 
-def proximas_sesiones(inicio: date, cantidad: int, dias, excluir=None) -> list:
+def proximas_sesiones(inicio: date, cantidad: int, dias, excluir=None,
+                      historial=None) -> list:
     """Las fechas exactas de las proximas N sesiones. Para mostrar el
     cronograma al alumno cuando compra."""
-    indices = dias_a_indices(dias)
-    if not indices or cantidad < 1:
+    if (not dias_a_indices(dias) and not historial) or cantidad < 1:
         return []
     excluir = set(excluir or ())
 
     fechas, fecha = [], inicio
     for _ in range(365 * 5):
+        indices = dias_a_indices(dias_en(fecha, dias, historial))
         if fecha.weekday() in indices and fecha not in excluir:
             fechas.append(fecha)
             if len(fechas) == cantidad:
@@ -377,6 +393,34 @@ def se_superpone(desde: date, vuelta: date | None, existentes) -> bool:
         if desde < (fin or date.max) and inicio < fin_nueva:
             return True
     return False
+
+
+# Feriados nacionales (Decreto Legislativo 713 y leyes que lo modifican,
+# calendario de gob.pe). Semana Santa cambia cada anio. Hay un proyecto en
+# el Congreso para mover algunos a lunes: revisar esta lista cada enero.
+FERIADOS_PERU = {
+    date(2026, 10, 8): "Combate de Angamos",
+    date(2026, 11, 1): "Todos los Santos",
+    date(2026, 12, 8): "Inmaculada Concepcion",
+    date(2026, 12, 9): "Batalla de Ayacucho",
+    date(2026, 12, 25): "Navidad",
+    date(2027, 1, 1): "Anio Nuevo",
+    date(2027, 3, 25): "Jueves Santo",
+    date(2027, 3, 26): "Viernes Santo",
+    date(2027, 5, 1): "Dia del Trabajo",
+    date(2027, 6, 7): "Batalla de Arica y Dia de la Bandera",
+    date(2027, 6, 29): "San Pedro y San Pablo",
+    date(2027, 7, 23): "Dia de la Fuerza Aerea",
+    date(2027, 7, 28): "Fiestas Patrias",
+    date(2027, 7, 29): "Fiestas Patrias",
+    date(2027, 8, 6): "Batalla de Junin",
+    date(2027, 8, 30): "Santa Rosa de Lima",
+    date(2027, 10, 8): "Combate de Angamos",
+    date(2027, 11, 1): "Todos los Santos",
+    date(2027, 12, 8): "Inmaculada Concepcion",
+    date(2027, 12, 9): "Batalla de Ayacucho",
+    date(2027, 12, 25): "Navidad",
+}
 
 
 def sesiones_txt(n) -> str:

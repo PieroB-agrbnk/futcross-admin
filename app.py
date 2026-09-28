@@ -27,7 +27,7 @@ theme.aplicar_estilos()
 
 # Se muestra en la barra lateral. Sirve para saber de un vistazo si la version
 # que estas viendo en la nube es la misma que tienes en tu computadora.
-VERSION = "3.5"
+VERSION = "3.6"
 
 DIAS_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
 TURNOS = ["MANANA", "TARDE", "NOCHE"]
@@ -1115,7 +1115,8 @@ def ficha_alumno(alumno_id: str) -> None:
             totales_pv = int(pv["sesiones_totales"])
             todas = logic.proximas_sesiones(
                 logic.a_fecha(pv["fecha_inicio"]), totales_pv, dias_pv,
-                excluir=db.fechas_sin_entrenar(pv.get("grupo_id")))
+                excluir=db.fechas_sin_entrenar(pv.get("grupo_id")),
+                historial=db.historial_dias(pv["id"]))
             if todas:
                 with st.expander(
                         f"Cronograma de sus {totales_pv} sesiones "
@@ -1303,17 +1304,21 @@ def editar_pedido(planes) -> None:
             or dias_grupo != str(pq.get("dias_asiste") or "")
             or grupo_id != pq.get("grupo_id"))
         sin_entrenar = db.fechas_sin_entrenar(grupo_id)
+        # Si el grupo cambio de horario a mitad del plan, lo anterior al
+        # cambio se cuenta con los dias de antes
+        historial = db.historial_dias(pq["id"])
         if fijar:
             fin = fin_manual
         elif cambio_calendario:
             fin = logic.fecha_fin_por_calendario(
                 inicio, int(sesiones), dias_grupo, int(plan["vigencia_dias"]),
-                excluir=sin_entrenar)
+                excluir=sin_entrenar, historial=historial)
         else:
             fin = fin_guardado
 
         cronograma = logic.proximas_sesiones(inicio, int(sesiones), dias_grupo,
-                                             excluir=sin_entrenar)
+                                             excluir=sin_entrenar,
+                                             historial=historial)
         if cronograma and fin:
             st.info(
                 f"**{logic.sesiones_txt(sesiones)}** entrenando "
@@ -2550,6 +2555,60 @@ def pagina_otros_ingresos() -> None:
 # =====================================================================
 # 11. DIAS SIN ENTRENAMIENTO
 # =====================================================================
+def feriados_nacionales(grupos: pd.DataFrame) -> None:
+    """Los feriados que vienen, para marcarlos de un solo clic.
+
+    Solo aparecen los que caen en un dia que entrena algun grupo y que
+    todavia no estan marcados. Si algun feriado si abren, se desmarca.
+    """
+    theme.seccion("Feriados nacionales que vienen",
+                  "marcalos de una vez y nadie pierde su clase")
+    marcados = db.fechas_sin_entrenar(None)
+    dias_de = {}
+    if not grupos.empty:
+        for _, g in grupos.iterrows():
+            for d in logic.dias_a_indices(g["dias"]):
+                dias_de.setdefault(d, []).append(str(g["sede"]).title())
+
+    filas = []
+    for fecha, nombre in sorted(logic.FERIADOS_PERU.items()):
+        if fecha < logic.hoy() or fecha in marcados:
+            continue
+        afecta = dias_de.get(fecha.weekday())
+        if not afecta:
+            continue
+        filas.append({"Marcar": True, "fecha": fecha,
+                      "Fecha": fecha_larga(fecha).title() + f" {fecha.year}",
+                      "Feriado": nombre, "Entrena": ", ".join(sorted(set(afecta)))})
+    if not filas:
+        st.caption("Todos los feriados que vienen ya estan marcados, o caen en "
+                   "dias que no se entrena.")
+        return
+
+    st.caption("Desmarca los feriados en que si vayan a abrir. Revisa esta lista "
+               "cada enero: algunos feriados se pueden mover por ley.")
+    editado = st.data_editor(
+        pd.DataFrame(filas), hide_index=True, width="stretch", key="editor_feriados",
+        disabled=["Fecha", "Feriado", "Entrena"],
+        column_config={"fecha": None,
+                       "Marcar": st.column_config.CheckboxColumn("Marcar"),
+                       "Entrena": st.column_config.TextColumn(
+                           "Afecta a", help="Sedes que entrenan ese dia")})
+    elegidos = editado[editado["Marcar"]]
+    if st.button(f"Marcar los {len(elegidos)} feriados seleccionados", type="primary",
+                 disabled=elegidos.empty, key="marcar_feriados"):
+        hechos = 0
+        for _, f in elegidos.iterrows():
+            try:
+                db.marcar_no_laborable(f["fecha"], None, f["Feriado"])
+                hechos += 1
+            except Exception as e:
+                if "duplicate" not in str(e).lower() and "uq_no_laborable" not in str(e):
+                    st.error(f"No se pudo marcar el {f['Fecha']}: {e}")
+        st.toast(f"{hechos} feriados marcados", icon="\u2705")
+        st.rerun()
+
+
 def pagina_dias_libres() -> None:
     theme.cabecera("Dias sin entrenamiento", fecha_larga(logic.hoy()).upper(),
                    "Feriados y cancelaciones")
@@ -2591,6 +2650,8 @@ def pagina_dias_libres() -> None:
                     st.warning("Ese dia ya estaba marcado para ese grupo.")
                 else:
                     st.error(f"No se pudo marcar: {e}")
+
+    feriados_nacionales(grupos)
 
     theme.seccion("Dias marcados", "de los ultimos meses")
     dias = db.dias_no_laborables(logic.hoy() - timedelta(days=180))

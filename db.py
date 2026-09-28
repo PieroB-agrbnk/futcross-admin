@@ -916,6 +916,22 @@ def fechas_sin_entrenar(grupo_id: str | None = None) -> set:
             if not r.get("grupo_id") or r.get("grupo_id") == grupo_id}
 
 
+@_cache(CACHE_CORTO, entradas=128)
+def historial_dias(paquete_id: str) -> list:
+    """Cambios de horario de un plan: [(hasta, dias_anteriores), ...].
+
+    Antes de `hasta` el plan entrenaba con esos dias. Lo usa la vista
+    previa para dibujar bien el cronograma de quien cambio de horario.
+    """
+    try:
+        rows = (_tabla("historial_dias").select("hasta,dias")
+                .eq("paquete_id", paquete_id).execute().data) or []
+    except Exception:
+        # La migracion 026 todavia no se corrio
+        return []
+    return [(logic.a_fecha(r["hasta"]), r["dias"]) for r in rows]
+
+
 def marcar_no_laborable(fecha: date, grupo_id: str | None, motivo: str):
     r = _tabla("dias_no_laborables").insert({
         "fecha": fecha.isoformat(),
