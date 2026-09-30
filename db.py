@@ -366,7 +366,7 @@ def importar_fila(fila: dict) -> str:
 
     plan = fila.get("_plan")
     if plan and fila.get("_inicio"):
-        crear_paquete(
+        creado = crear_paquete(
             alumno_id, plan, fila["_inicio"],
             float(fila.get("_cobrado") or 0), "IMPORTADO", True, "Carga masiva",
             fecha_pedido=fila["_inicio"], sede=None,
@@ -375,6 +375,11 @@ def importar_fila(fila: dict) -> str:
             tipo="NUEVO", grupo_id=grupo.get("id"),
             precio_lista=float(fila.get("_lista") or fila.get("_cobrado") or 0),
             monto_entregado=float(fila.get("_entregado") or 0))
+        # Si el archivo trae los dias de antes de un cambio de horario (un
+        # plan de setiembre en Surco con LUN MIE VIE), se guardan tal cual
+        if creado and fila.get("_historial"):
+            for hasta, dias in fila["_historial"]:
+                fijar_historial(creado[0]["id"], hasta, dias, fila.get("dias_asiste"))
     return codigo
 
 
@@ -914,6 +919,48 @@ def fechas_sin_entrenar(grupo_id: str | None = None) -> set:
         return set()
     return {logic.a_fecha(r["fecha"]) for r in rows
             if not r.get("grupo_id") or r.get("grupo_id") == grupo_id}
+
+
+@_cache(CACHE_LARGO)
+def cambios_todos() -> dict:
+    """{grupo_id: [(desde, dias_antes), ...]}: los cambios de horario de
+    cada grupo. Un plan que empezo antes de un cambio cuenta los dias de
+    antes hasta esa fecha."""
+    try:
+        rows = (_tabla("cambios_grupo").select("grupo_id,desde,dias_antes")
+                .execute().data) or []
+    except Exception:
+        # La migracion 028 todavia no se corrio
+        return {}
+    salida: dict = {}
+    for r in rows:
+        salida.setdefault(r["grupo_id"], []).append(
+            (logic.a_fecha(r["desde"]), r["dias_antes"]))
+    for lista in salida.values():
+        lista.sort()
+    return salida
+
+
+def cambios_grupo(grupo_id: str | None) -> list:
+    return list(cambios_todos().get(grupo_id, [])) if grupo_id else []
+
+
+def fijar_historial(paquete_id: str, hasta: date, dias: str, dias_actuales: str | None):
+    """Guarda con que dias entrenaba un plan antes de `hasta`.
+
+    Si son los mismos de ahora no hace falta historial y se borra. La base
+    recalcula la fecha de fin en los dos casos.
+    """
+    orden = {d: i for i, d in enumerate(logic.ORDEN_SEMANA)}
+    dias = " ".join(sorted(set((dias or "").split()), key=lambda d: orden.get(d, 9)))
+    if not dias or dias == " ".join((dias_actuales or "").split()):
+        _tabla("historial_dias").delete().eq("paquete_id", paquete_id) \
+            .eq("hasta", hasta.isoformat()).execute()
+    else:
+        _tabla("historial_dias").upsert({
+            "paquete_id": paquete_id, "hasta": hasta.isoformat(), "dias": dias,
+        }, on_conflict="paquete_id,hasta").execute()
+    invalidar_cache()
 
 
 @_cache(CACHE_CORTO, entradas=128)

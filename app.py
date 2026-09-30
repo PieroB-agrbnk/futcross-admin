@@ -27,7 +27,7 @@ theme.aplicar_estilos()
 
 # Se muestra en la barra lateral. Sirve para saber de un vistazo si la version
 # que estas viendo en la nube es la misma que tienes en tu computadora.
-VERSION = "3.7"
+VERSION = "3.8"
 
 DIAS_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
 TURNOS = ["MANANA", "TARDE", "NOCHE"]
@@ -99,6 +99,43 @@ def selector_de_grupo(etiqueta="Grupo", clave=None, grupo_actual=None,
     if dias:
         texto += f" - {logic.frecuencia(dias)}"
     return g["id"], dias, texto
+
+
+def dias_antes_del_cambio(grupo_id, inicio, dias_actuales, frecuencia, clave,
+                          previos=None) -> list:
+    """Si el grupo cambio de horario despues de que empezo el plan, pregunta
+    que dias iba el alumno antes del cambio. Devuelve [(desde, dias)].
+
+    Es el caso de Surco: un plan que empezo en setiembre conto lunes hasta
+    el 30 y desde octubre corre con miercoles y viernes. Se propone lo
+    mismo que calcula la base: segun la frecuencia del plan.
+    """
+    if not grupo_id or not inicio:
+        return []
+    salida = []
+    orden = {d: i for i, d in enumerate(DIAS_SEMANA)}
+    if frecuencia is not None and pd.isna(frecuencia):
+        frecuencia = None
+    for desde, antes in db.cambios_grupo(grupo_id):
+        if desde <= inicio:
+            continue
+        disponibles = [d for d in str(antes).split() if d in DIAS_SEMANA]
+        sugerido = (previos or {}).get(desde) or logic.dias_previos(
+            dias_actuales, antes, frecuencia)
+        hasta_txt = (desde - timedelta(days=1)).strftime("%d/%m")
+        elegidos = st.multiselect(
+            f"Dias que iba hasta el {hasta_txt}", disponibles,
+            default=[d for d in str(sugerido).split() if d in disponibles],
+            key=f"{clave}_antes_{grupo_id}_{desde}_{frecuencia}",
+            help=f"Este grupo cambio de horario el {desde.strftime('%d/%m')}: "
+                 f"antes entrenaba {antes}. Lo de antes se cuenta con estos dias.")
+        st.caption(f"El plan empezo antes del cambio de horario del "
+                   f"{desde.strftime('%d/%m')}: hasta el {hasta_txt} cuenta con "
+                   f"{' '.join(sorted(elegidos, key=lambda d: orden[d])) or 'ningun dia'}, "
+                   f"y desde ahi con {dias_actuales or 'los dias de hoy'}.")
+        if elegidos:
+            salida.append((desde, " ".join(sorted(elegidos, key=lambda d: orden[d]))))
+    return salida
 
 
 def fecha_larga(d) -> str:
@@ -980,6 +1017,10 @@ def pagina_alumnos() -> None:
                 dias_del_plan=int(frecuencia_plan) if frecuencia_plan else None)
             if detalle:
                 st.caption(detalle)
+            historial_insc = []
+            if plan_elegido is not None:
+                historial_insc = dias_antes_del_cambio(
+                    grupo_id, inicio_plan, dias_grupo, frecuencia_plan, k("antes"))
 
             lista_plan = precio_plan = medio_plan = None
             recibido_plan = vendedor_plan = None
@@ -988,7 +1029,8 @@ def pagina_alumnos() -> None:
                 fin_plan = logic.fecha_fin_por_calendario(
                     inicio_plan, int(plan_elegido["sesiones"]), dias_grupo,
                     int(plan_elegido["vigencia_dias"]),
-                    excluir=db.fechas_sin_entrenar(grupo_id))
+                    excluir=db.fechas_sin_entrenar(grupo_id),
+                    historial=historial_insc)
                 if dias_grupo:
                     st.info(
                         f"**{logic.sesiones_txt(plan_elegido['sesiones'])}** entrenando "
@@ -1058,6 +1100,12 @@ def pagina_alumnos() -> None:
                             if guardado and isinstance(guardado, list) \
                                     and guardado[0].get("fecha_fin"):
                                 fin_final = logic.a_fecha(guardado[0]["fecha_fin"])
+                                if historial_insc:
+                                    pid = guardado[0]["id"]
+                                    for hasta, dias_prev in historial_insc:
+                                        db.fijar_historial(pid, hasta, dias_prev, dias_grupo)
+                                    fin_final = logic.a_fecha(
+                                        (db.paquete(pid) or {}).get("fecha_fin")) or fin_final
                             aviso += (f" Se registro su {plan_elegido['nombre']}: "
                                       f"ultima sesion el {fecha_larga(fin_final)}.")
                         else:
@@ -1369,6 +1417,12 @@ def editar_pedido(planes) -> None:
             dias_previos=str(pq.get("dias_asiste") or ""))
         if detalle:
             st.caption(detalle)
+        # Si el plan empezo antes de un cambio de horario, se muestran (y se
+        # pueden corregir) los dias que iba antes
+        hist_guardado = dict(db.historial_dias(pq["id"]))
+        historial_ep = dias_antes_del_cambio(
+            grupo_id, inicio, dias_grupo, plan.get("dias_por_semana"), k("antes"),
+            previos=hist_guardado)
 
         # Si se cambia de plan, se proponen las sesiones del plan nuevo
         mismo_plan = nombre_plan == actual
@@ -1438,11 +1492,12 @@ def editar_pedido(planes) -> None:
             inicio != logic.a_fecha(pq["fecha_inicio"])
             or int(sesiones) != int(pq["sesiones_totales"])
             or dias_grupo != str(pq.get("dias_asiste") or "")
-            or grupo_id != pq.get("grupo_id"))
+            or grupo_id != pq.get("grupo_id")
+            or any(hist_guardado.get(h) != d for h, d in historial_ep))
         sin_entrenar = db.fechas_sin_entrenar(grupo_id)
         # Si el grupo cambio de horario a mitad del plan, lo anterior al
         # cambio se cuenta con los dias de antes
-        historial = db.historial_dias(pq["id"])
+        historial = historial_ep or db.historial_dias(pq["id"])
         if fijar:
             fin = fin_manual
         elif cambio_calendario:
@@ -1494,6 +1549,8 @@ def editar_pedido(planes) -> None:
                         quien=ETIQUETA_ROL.get(rol(), ""),
                         fin_manual=fin_manual if fijar else None,
                         motivo_fin=(motivo_fin or "").strip() or None)
+                    for hasta, dias_prev in historial_ep:
+                        db.fijar_historial(pq["id"], hasta, dias_prev, dias_grupo)
                     nuevo = db.paquete(pq["id"]) or {}
                     fin_real = logic.a_fecha(nuevo.get("fecha_fin")) or fin
                     st.toast("Pedido corregido", icon="\u2705")
@@ -1616,6 +1673,8 @@ def pagina_paquetes() -> None:
                     dias_del_plan=int(frec) if frec else None)
                 if detalle:
                     st.caption(detalle)
+                historial_venta = dias_antes_del_cambio(
+                    grupo_id, inicio, dias_grupo, frec, k("antes"))
 
                 # Lo que depende del plan lleva el plan en la clave: al cambiar
                 # de plan se proponen sus sesiones y su precio, no los del
@@ -1636,7 +1695,8 @@ def pagina_paquetes() -> None:
                 # grupo, saltando los dias sin entrenamiento ya marcados
                 sin_entrenar = db.fechas_sin_entrenar(grupo_id)
                 fin = logic.fecha_fin_por_calendario(inicio, int(sesiones), dias_grupo,
-                                                     int(vigencia), excluir=sin_entrenar)
+                                                     int(vigencia), excluir=sin_entrenar,
+                                                     historial=historial_venta)
                 sede = None
 
                 st.markdown("**Cobro**")
@@ -1720,7 +1780,8 @@ def pagina_paquetes() -> None:
                         )
 
                 cronograma = logic.proximas_sesiones(inicio, int(sesiones), dias_grupo,
-                                                     excluir=sin_entrenar)
+                                                     excluir=sin_entrenar,
+                                                     historial=historial_venta)
                 if cronograma:
                     st.info(
                         f"**{logic.sesiones_txt(sesiones)}** entrenando "
@@ -1755,6 +1816,12 @@ def pagina_paquetes() -> None:
                         if guardado and isinstance(guardado, list) \
                                 and guardado[0].get("fecha_fin"):
                             fin_real = logic.a_fecha(guardado[0]["fecha_fin"])
+                            if historial_venta:
+                                pid = guardado[0]["id"]
+                                for hasta, dias_prev in historial_venta:
+                                    db.fijar_historial(pid, hasta, dias_prev, dias_grupo)
+                                fin_real = logic.a_fecha(
+                                    (db.paquete(pid) or {}).get("fecha_fin")) or fin_real
                         st.toast(f"Pedido {pedido} registrado", icon="\u2705")
                         aviso_pedido = (f"Pedido N {pedido} registrado. "
                                         f"Ultima sesion el {fin_real.strftime('%d/%m/%Y')}.")
@@ -2539,7 +2606,8 @@ def pagina_carga_masiva() -> None:
     except Exception:
         existentes = {}
 
-    validadas = importar.validar(crudo.to_dict("records"), grupos, planes, existentes)
+    validadas = importar.validar(crudo.to_dict("records"), grupos, planes, existentes,
+                                 cambios=db.cambios_todos())
     res = importar.resumen(validadas)
 
     theme.seccion("3. Revisa antes de guardar", f"{res['total']} filas leidas")

@@ -423,6 +423,56 @@ FERIADOS_PERU = {
 }
 
 
+ORDEN_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
+
+
+def _lista_dias(dias) -> list:
+    if not dias:
+        return []
+    if isinstance(dias, str):
+        dias = dias.replace(",", " ").split()
+    return [d.strip().upper()[:3] for d in dias if d.strip()]
+
+
+def ajustar_dias(viejos, nuevos) -> str:
+    """Los dias de un alumno despues de un cambio de horario del grupo.
+
+    Se quedan los que siguen existiendo y se completa con los nuevos hasta
+    la misma cantidad. Misma regla que fc_ajustar_dias en la base.
+    """
+    v, n = _lista_dias(viejos), _lista_dias(nuevos)
+    if not v:
+        return " ".join(n)
+    meta = min(len(v), len(n))
+    quedan = [d for d in n if d in v]
+    for d in n:
+        if len(quedan) >= meta:
+            break
+        if d not in quedan:
+            quedan.append(d)
+    return " ".join(d for d in n if d in quedan)
+
+
+def dias_previos(actuales, antes, frecuencia=None) -> str:
+    """Los dias que un plan tenia antes de un cambio de horario, por defecto.
+
+    Se quedan los de hoy que tambien existian antes y se completa con los
+    de antes hasta la frecuencia del plan: un premium de Surco vuelve a
+    LUN MIE VIE. Misma regla que fc_dias_previos en la base.
+    """
+    a, b = _lista_dias(actuales), _lista_dias(antes)
+    if not b:
+        return " ".join(a)
+    meta = min(int(frecuencia) if frecuencia else len(a), len(b))
+    quedan = [d for d in b if d in a]
+    for d in b:
+        if len(quedan) >= meta:
+            break
+        if d not in quedan:
+            quedan.append(d)
+    return " ".join(d for d in b if d in quedan)
+
+
 def sesiones_txt(n) -> str:
     """'1 sesion', '12 sesiones'. Evita el '1 sesiones' de la pantalla."""
     n = int(n)

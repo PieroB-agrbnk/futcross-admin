@@ -136,7 +136,8 @@ def buscar_plan(nombre: str, planes: list[dict]) -> dict | None:
 
 
 def validar(filas: list[dict], grupos: list[dict], planes: list[dict],
-            dnis_existentes: dict | None = None) -> list[dict]:
+            dnis_existentes: dict | None = None,
+            cambios: dict | None = None) -> list[dict]:
     """Revisa cada fila y devuelve el resultado listo para mostrar.
 
     Cada elemento trae los datos ya normalizados mas `_problemas` (lista
@@ -173,6 +174,7 @@ def validar(filas: list[dict], grupos: list[dict], planes: list[dict],
             problemas.append(f"no existe el grupo '{fila['grupo']}'")
         fila["_grupo"] = g
         disponibles = str(g.get("dias", "")).split() if g else []
+        fila["_historial"] = []
 
         if fila["dias_asiste"]:
             pedidos = [d.strip().upper()[:3] for d in
@@ -180,6 +182,19 @@ def validar(filas: list[dict], grupos: list[dict], planes: list[dict],
             invalidos = [d for d in pedidos if d not in logic.INDICE_DIA]
             fuera = [d for d in pedidos if d in logic.INDICE_DIA
                      and disponibles and d not in disponibles]
+
+            # Un plan que empezo antes de un cambio de horario del grupo puede
+            # traer los dias de entonces (Surco con lunes en setiembre): esos
+            # rigen hasta el cambio, y desde ahi los que correspondan hoy.
+            inicio_fila = leer_fecha(cruda.get("fecha_inicio"))
+            if fuera and g and inicio_fila and not invalidos:
+                previos = [(desde, antes) for desde, antes
+                           in (cambios or {}).get(g.get("id"), []) if desde > inicio_fila]
+                if previos and all(d in previos[0][1].split() for d in pedidos):
+                    fila["_historial"] = [(previos[0][0], logic.ajustar_dias(
+                        pedidos, previos[0][1]))]
+                    pedidos = logic.ajustar_dias(pedidos, g.get("dias", "")).split()
+                    fuera = []
             if invalidos:
                 problemas.append(f"dias que no existen: {' '.join(invalidos)}")
             if fuera:
@@ -231,7 +246,8 @@ def validar(filas: list[dict], grupos: list[dict], planes: list[dict],
         if inicio and pl and fila["dias_asiste"]:
             fila["_fin"] = logic.fecha_fin_por_calendario(
                 inicio, int(pl["sesiones"]), fila["dias_asiste"],
-                int(pl.get("vigencia_dias") or 30))
+                int(pl.get("vigencia_dias") or 30),
+                historial=fila.get("_historial"))
         else:
             fila["_fin"] = None
 
