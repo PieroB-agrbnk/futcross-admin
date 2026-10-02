@@ -111,7 +111,7 @@ def dias_restantes(paquete: dict, ref: date | None = None) -> int | None:
 # Puerta: quien puede entrenar
 # ---------------------------------------------------------------------
 def puede_entrenar(paquete: dict | None, ya_marco_hoy: bool = False,
-                   ref: date | None = None) -> tuple[bool, str, str]:
+                   ref: date | None = None, fechas=None) -> tuple[bool, str, str]:
     """Decide si el alumno entra a la sesion.
 
     Devuelve (autorizado, codigo_motivo, mensaje para pantalla).
@@ -140,7 +140,10 @@ def puede_entrenar(paquete: dict | None, ya_marco_hoy: bool = False,
     # Hoy no es su dia: puede pasar, pero esa clase se le descuenta como
     # extra (migracion 029) y su plan termina una clase antes.
     dias = paquete.get("dias_asiste")
-    if dias and not es_dia_de_entrenamiento(ref, dias):
+    # Con fechas a medida, lo que manda es su lista de fechas
+    fuera_de_fecha = (ref not in set(fechas)) if fechas else (
+        bool(dias) and not es_dia_de_entrenamiento(ref, dias))
+    if fuera_de_fecha:
         return True, "OTRO_DIA", (
             "Hoy no es uno de tus dias. Puedes entrenar, y esta clase se te "
             "descuenta como una clase extra.")
@@ -471,6 +474,101 @@ def dias_previos(actuales, antes, frecuencia=None) -> str:
         if d not in quedan:
             quedan.append(d)
     return " ".join(d for d in b if d in quedan)
+
+
+MESES_TXT = {"ene": 1, "feb": 2, "mar": 3, "abr": 4, "may": 5, "jun": 6, "jul": 7,
+             "ago": 8, "set": 9, "sep": 9, "oct": 10, "nov": 11, "dic": 12}
+
+
+def leer_fechas(texto: str, referencia: date) -> tuple[list, list]:
+    """Lee una lista de fechas escrita a mano: (fechas, lo_que_no_entendio).
+
+    Acepta como lo escribe Gary: "30/09, 02/10, 05/10", o "30 setiembre,
+    2, 5, 9, 16": un numero solo sigue en el mes anterior, y pasa al mes
+    siguiente si el dia es menor que el anterior. El anio sale de la
+    fecha de referencia (el inicio del plan).
+    """
+    import re
+    fechas, malas = [], []
+    mes, anio, ultimo = referencia.month, referencia.year, 0
+    partes = [t.strip() for t in re.split(r"[,;\n]+", (texto or "").lower()) if t.strip()]
+    for t in partes:
+        try:
+            m = re.fullmatch(r"(\d{1,2})\s*/\s*(\d{1,2})(?:\s*/\s*(\d{2,4}))?", t)
+            m2 = re.fullmatch(r"(\d{1,2})\s*(?:de\s+)?([a-z]{3})[a-z]*", t)
+            if m:
+                dia, mes_n = int(m.group(1)), int(m.group(2))
+                if m.group(3):
+                    anio = int(m.group(3)) + (2000 if len(m.group(3)) == 2 else 0)
+                elif mes_n < mes and (mes - mes_n) > 6:
+                    anio += 1
+                mes = mes_n
+            elif m2 and m2.group(2) in MESES_TXT:
+                dia, mes_n = int(m2.group(1)), MESES_TXT[m2.group(2)]
+                if mes_n < mes and (mes - mes_n) > 6:
+                    anio += 1
+                mes = mes_n
+            elif t.isdigit():
+                dia = int(t)
+                if dia < ultimo:
+                    mes += 1
+                    if mes > 12:
+                        mes, anio = 1, anio + 1
+            else:
+                malas.append(t)
+                continue
+            f = date(anio, mes, dia)
+            fechas.append(f)
+            ultimo = dia
+        except ValueError:
+            malas.append(t)
+    return sorted(set(fechas)), malas
+
+
+def reporte_asistencia(inicio: date, hasta: date, dias, asistencias,
+                       excluir=None, historial=None, fechas=None,
+                       pausas=None) -> list:
+    """Una fila por cada dia que le tocaba o que vino, de inicio a hasta.
+
+    Estados: Vino, Falto, En pausa, Sin entrenamiento y Clase extra (vino
+    un dia que no le tocaba). Es lo que se le muestra a un cliente que dice
+    que un dia no fue.
+    """
+    excluir = set(excluir or ())
+    fechas = set(fechas or ())
+    pausas = list(pausas or ())
+    marcas = {}
+    for a in asistencias or []:
+        f = a.get("fecha")
+        f = f if isinstance(f, date) else date.fromisoformat(str(f)[:10])
+        marcas.setdefault(f, a)
+
+    filas, d = [], inicio
+    while d <= hasta:
+        if fechas:
+            toca = d in fechas
+        else:
+            toca = d.weekday() in dias_a_indices(dias_en(d, dias, historial))
+        pausa = any(a <= d < (b or date.max) for a, b in pausas if a)
+        marca = marcas.get(d)
+        if toca or marca:
+            if marca:
+                estado = "Vino" if toca and not pausa and d not in excluir else "Clase extra"
+            elif pausa:
+                estado = "En pausa"
+            elif d in excluir:
+                estado = "Sin entrenamiento"
+            else:
+                estado = "Falto"
+            filas.append({
+                "fecha": d, "estado": estado,
+                "hora": (marca or {}).get("hora"),
+                "sede": (marca or {}).get("sede"),
+                "marcado_por": (marca or {}).get("marcado_por"),
+                "origen": (marca or {}).get("origen"),
+            })
+        d += timedelta(days=1)
+    return filas
 
 
 def sesiones_txt(n) -> str:

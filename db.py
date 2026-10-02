@@ -963,6 +963,38 @@ def fijar_historial(paquete_id: str, hasta: date, dias: str, dias_actuales: str 
     invalidar_cache()
 
 
+@_cache(CACHE_CORTO)
+def fechas_todas() -> dict:
+    """{paquete_id: [fechas]} de los planes con fechas a medida."""
+    try:
+        rows = (_tabla("fechas_paquete").select("paquete_id,fecha")
+                .execute().data) or []
+    except Exception:
+        # La migracion 030 todavia no se corrio
+        return {}
+    salida: dict = {}
+    for r in rows:
+        salida.setdefault(r["paquete_id"], []).append(logic.a_fecha(r["fecha"]))
+    for lista in salida.values():
+        lista.sort()
+    return salida
+
+
+def fechas_de(paquete_id: str | None) -> list:
+    return list(fechas_todas().get(paquete_id, [])) if paquete_id else []
+
+
+def fijar_fechas(paquete_id: str, fechas: list) -> None:
+    """Deja exactamente estas fechas a medida (o ninguna, si viene vacia).
+    La base recalcula la fecha de fin."""
+    _tabla("fechas_paquete").delete().eq("paquete_id", paquete_id).execute()
+    if fechas:
+        _tabla("fechas_paquete").insert(
+            [{"paquete_id": paquete_id, "fecha": f.isoformat()}
+             for f in sorted(set(fechas))]).execute()
+    invalidar_cache()
+
+
 @_cache(CACHE_CORTO, entradas=128)
 def historial_dias(paquete_id: str) -> list:
     """Cambios de horario de un plan: [(hasta, dias_anteriores), ...].
@@ -1006,7 +1038,8 @@ def ya_marco_hoy(alumno_id: str, fecha: date | None = None) -> bool:
 
 
 def marcar_asistencia(alumno_id: str, paquete_id: str, sede: str | None = None,
-                      origen: str = "KIOSCO", fecha: date | None = None):
+                      origen: str = "KIOSCO", fecha: date | None = None,
+                      marcado_por: str | None = None):
     payload = {
         "alumno_id": alumno_id,
         "paquete_id": paquete_id,
@@ -1015,16 +1048,24 @@ def marcar_asistencia(alumno_id: str, paquete_id: str, sede: str | None = None,
     }
     if fecha:
         payload["fecha"] = fecha.isoformat()
-    try:
-        r = _tabla("asistencias").insert(payload).execute().data
-    except Exception as e:
-        # Si la base no conoce el origen nuevo (el pase de lista usa
-        # "LISTA"), se guarda con el de siempre en vez de perder la marca
-        if "origen" in str(e) and payload["origen"] != "KIOSCO":
-            payload["origen"] = "KIOSCO"
+    if marcado_por:
+        # Quien marco: para el reporte de asistencia del alumno
+        payload["marcado_por"] = marcado_por.strip().title()
+    for _ in range(3):
+        try:
             r = _tabla("asistencias").insert(payload).execute().data
-        else:
-            raise
+            break
+        except Exception as e:
+            texto = str(e)
+            # Nunca perder la marca: si la base no conoce el origen nuevo o
+            # todavia no tiene la columna del profe (falta la migracion
+            # 030), se guarda sin eso
+            if "marcado_por" in texto and "marcado_por" in payload:
+                payload.pop("marcado_por")
+            elif "origen" in texto and payload["origen"] != "KIOSCO":
+                payload["origen"] = "KIOSCO"
+            else:
+                raise
     invalidar_cache()
     return r
 

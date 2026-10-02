@@ -27,7 +27,7 @@ theme.aplicar_estilos()
 
 # Se muestra en la barra lateral. Sirve para saber de un vistazo si la version
 # que estas viendo en la nube es la misma que tienes en tu computadora.
-VERSION = "3.9"
+VERSION = "4.0"
 
 DIAS_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
 TURNOS = ["MANANA", "TARDE", "NOCHE"]
@@ -400,7 +400,8 @@ def procesar_marca(fila: dict) -> None:
         pq = db.ultimo_paquete(alumno_id)
 
     marco = db.ya_marco_hoy(alumno_id)
-    autorizado, motivo, mensaje = logic.puede_entrenar(pq, ya_marco_hoy=marco)
+    autorizado, motivo, mensaje = logic.puede_entrenar(
+        pq, ya_marco_hoy=marco, fechas=db.fechas_de(pq.get("id")) if pq else None)
 
     # El plan corre por calendario: marcar NO descuenta nada, solo deja
     # constancia de quien vino. Estas dos cifras salen de la vista.
@@ -412,7 +413,9 @@ def procesar_marca(fila: dict) -> None:
 
     if autorizado:
         try:
-            db.marcar_asistencia(alumno_id, pq["id"], sede=fila.get("sede"), origen="KIOSCO")
+            db.marcar_asistencia(alumno_id, pq["id"], sede=fila.get("sede"), origen="KIOSCO",
+                                 marcado_por=st.session_state.get("lista_profe")
+                                 or ETIQUETA_ROL.get(rol(), ""))
         except Exception as e:
             if "uq_asistencia_dia" in str(e) or "duplicate" in str(e).lower():
                 autorizado, motivo = False, "YA_MARCO"
@@ -512,9 +515,21 @@ def pasar_lista() -> None:
                           key="lista_fecha",
                           help="Hasta una semana atras, por si se paso la lista tarde")
 
+    profe = st.text_input(
+        "Profe que pasa lista", key="lista_profe", placeholder="Ej. Marco",
+        help="Queda guardado en cada asistencia, para el reporte del alumno")
+
     alumnos = db.panel_alumnos()
-    del_grupo = alumnos[alumnos["grupo_id"] == g["id"]] if not alumnos.empty \
-        and "grupo_id" in alumnos.columns else pd.DataFrame()
+    a_medida = db.fechas_todas()
+    # Los de este grupo, y los que tienen fechas a medida para ese dia aunque
+    # sean de otra sede (pueden ir a cualquiera)
+    if not alumnos.empty and "grupo_id" in alumnos.columns:
+        de_hoy = alumnos["paquete_id"].map(
+            lambda pid: fecha in set(a_medida.get(pid, []))) \
+            if a_medida and "paquete_id" in alumnos.columns else False
+        del_grupo = alumnos[(alumnos["grupo_id"] == g["id"]) | de_hoy]
+    else:
+        del_grupo = pd.DataFrame()
     if del_grupo.empty:
         theme.vacio("Este grupo no tiene alumnos", "Inscribelos en la pantalla Alumnos.")
         return
@@ -526,7 +541,13 @@ def pasar_lista() -> None:
     for _, a in del_grupo.iterrows():
         dias = a.get("dias_asiste")
         dias = "" if dias is None or (isinstance(dias, float) and pd.isna(dias)) else str(dias)
-        toca = logic.es_dia_de_entrenamiento(fecha, dias)
+        propias = a_medida.get(a.get("paquete_id"))
+        otra_sede = a.get("grupo_id") != g["id"]
+        if propias:
+            toca = fecha in set(propias) and not otra_sede
+            dias = "A medida"
+        else:
+            toca = logic.es_dia_de_entrenamiento(fecha, dias)
         activo = a.get("estado_real") == "ACTIVO"
         restantes = a.get("sesiones_restantes")
         filas.append({
@@ -536,6 +557,7 @@ def pasar_lista() -> None:
             "Quedan": None if pd.isna(restantes) else int(restantes),
             "Estado": ("Ya marcado" if a["alumno_id"] in ya
                        else "Le toca hoy" if toca and activo
+                       else "A medida: le toca hoy" if propias and otra_sede and activo
                        else "Otro dia: clase extra" if activo
                        else str(a.get("estado_real") or "").title()),
         })
@@ -568,8 +590,11 @@ def pasar_lista() -> None:
         })
 
     nuevos = editado[editado["Vino"] & ~editado["ya"]]
+    if not (profe or "").strip() and not nuevos.empty:
+        st.caption("Escribe arriba el nombre del profe para poder guardar la lista.")
     if st.button(f"Guardar lista ({len(nuevos)} por registrar)", type="primary",
-                 disabled=nuevos.empty, key="lista_guardar", width="stretch"):
+                 disabled=nuevos.empty or not (profe or "").strip(),
+                 key="lista_guardar", width="stretch"):
         hechos, sin_plan, extras = 0, [], []
         for _, f in nuevos.iterrows():
             if not f["activo"] or pd.isna(f["paquete_id"]) or not f["paquete_id"]:
@@ -578,7 +603,8 @@ def pasar_lista() -> None:
             try:
                 db.marcar_asistencia(f["alumno_id"], f["paquete_id"], sede=g["sede"],
                                      origen="LISTA",
-                                     fecha=None if fecha == hoy else fecha)
+                                     fecha=None if fecha == hoy else fecha,
+                                     marcado_por=profe)
                 hechos += 1
                 if str(f["Estado"]).startswith("Otro dia"):
                     extras.append(f["Alumno"])
@@ -1239,6 +1265,80 @@ def editar_alumno() -> None:
                     st.error(f"No se pudo guardar: {e}")
 
 
+def reporte_de_asistencia(a: dict, paquetes: pd.DataFrame) -> None:
+    """Dia por dia de un plan: cuando le tocaba, si vino, a que hora, en que
+    sede y que profe lo marco.
+
+    Para cuando un cliente dice "ese dia no fui, estaba enfermo": aca se ve
+    si alguien lo marco, y si no aviso una pausa, esa clase se perdio.
+    """
+    if paquetes.empty:
+        return
+    vivos = paquetes[paquetes["estado_real"] != "CANCELADO"] \
+        if "estado_real" in paquetes.columns else paquetes
+    if vivos.empty:
+        return
+    theme.seccion("Reporte de asistencia", "dia por dia de cada plan")
+
+    def etiqueta(r):
+        ini = logic.a_fecha(r["fecha_inicio"])
+        fin = logic.a_fecha(r["fecha_fin"])
+        return (f"N {r.get('nro_pedido') or '-'} · {r['plan_nombre']} · "
+                f"{ini.strftime('%d/%m/%Y')} al {fin.strftime('%d/%m/%Y')}")
+    opciones = {etiqueta(r): r for _, r in vivos.iterrows()}
+    elegido = st.selectbox("Plan", list(opciones), key=f"rep_plan_{a['id']}")
+    pq = opciones[elegido]
+
+    inicio = logic.a_fecha(pq["fecha_inicio"])
+    hasta = min(logic.hoy(), logic.a_fecha(pq["fecha_fin"]))
+    if hasta < inicio:
+        st.caption("Este plan todavia no empieza.")
+        return
+
+    asis = db.asistencias_de(a["id"], inicio, hasta)
+    if not asis.empty and "paquete_id" in asis.columns:
+        asis = asis[asis["paquete_id"] == pq["id"]]
+    dias = pq.get("dias_asiste")
+    dias = "" if dias is None or (isinstance(dias, float) and pd.isna(dias)) else str(dias)
+    filas = logic.reporte_asistencia(
+        inicio, hasta, dias,
+        [] if asis.empty else asis.to_dict("records"),
+        excluir=db.fechas_sin_entrenar(pq.get("grupo_id")),
+        historial=db.historial_dias(pq["id"]),
+        fechas=db.fechas_de(pq["id"]),
+        pausas=db.pausas_de(pq["id"]))
+    if not filas:
+        st.caption("Todavia no hay clases en este plan.")
+        return
+
+    cuenta = pd.Series([f["estado"] for f in filas]).value_counts()
+    theme.kpis([
+        ("Vino", int(cuenta.get("Vino", 0)), "en sus dias", "verde"),
+        ("Falto", int(cuenta.get("Falto", 0)), "sin aviso",
+         "rojo" if cuenta.get("Falto", 0) else "verde"),
+        ("Clases extra", int(cuenta.get("Clase extra", 0)), "en otros dias", "naranja"),
+        ("En pausa", int(cuenta.get("En pausa", 0)), "congelado", "neutro"),
+    ])
+
+    origenes = {"LISTA": "Pase de lista", "KIOSCO": "Tablet o recepcion"}
+    tabla = pd.DataFrame([{
+        "Fecha": f["fecha"].strftime("%d/%m/%Y"),
+        "Dia": DIAS_SEMANA[f["fecha"].weekday()],
+        "Estado": f["estado"],
+        "Hora": str(f["hora"])[:5] if f["hora"] else "",
+        "Sede": f["sede"] or "",
+        "Marco": f["marcado_por"] or "",
+        "Como": origenes.get(str(f["origen"] or ""), f["origen"] or ""),
+    } for f in reversed(filas)])
+    st.dataframe(tabla, width="stretch", hide_index=True,
+                 height=min(420, 38 + 35 * len(tabla)))
+    st.caption("Falto: le tocaba y nadie lo marco. Si estuvo enfermo y no aviso, "
+               "esa clase se perdio; si aviso con evidencia, se registra una pausa.")
+    descargar_csv("Descargar reporte", tabla,
+                  f"asistencia_{a['codigo']}_{pq.get('nro_pedido') or ''}.csv",
+                  clave=f"rep_csv_{a['id']}")
+
+
 def ficha_alumno(alumno_id: str) -> None:
     a = db.alumno(alumno_id)
     if not a:
@@ -1302,10 +1402,15 @@ def ficha_alumno(alumno_id: str) -> None:
         if dias_pv and not pd.isna(dias_pv):
             usadas_pv = int(pv["sesiones_usadas"])
             totales_pv = int(pv["sesiones_totales"])
-            todas = logic.proximas_sesiones(
-                logic.a_fecha(pv["fecha_inicio"]), totales_pv, dias_pv,
-                excluir=db.fechas_sin_entrenar(pv.get("grupo_id")),
-                historial=db.historial_dias(pv["id"]))
+            fechas_pv = db.fechas_de(pv["id"])
+            if fechas_pv:
+                # Plan a medida: su cronograma son sus fechas acordadas
+                todas = fechas_pv[:totales_pv]
+            else:
+                todas = logic.proximas_sesiones(
+                    logic.a_fecha(pv["fecha_inicio"]), totales_pv, dias_pv,
+                    excluir=db.fechas_sin_entrenar(pv.get("grupo_id")),
+                    historial=db.historial_dias(pv["id"]))
             if todas:
                 with st.expander(
                         f"Cronograma de sus {totales_pv} sesiones "
@@ -1328,6 +1433,8 @@ def ficha_alumno(alumno_id: str) -> None:
         hist.columns = ["Plan", "Inicio", "Fin", "Usadas", "Totales",
                         "Dias congelados", "Precio", "Estado"]
         st.dataframe(hist, width="stretch", hide_index=True)
+
+    reporte_de_asistencia(a, paquetes)
 
     # Solo las de este alumno: antes se bajaban seis meses de asistencias de
     # toda la academia para despues filtrar una sola persona en pandas.
@@ -1493,12 +1600,41 @@ def editar_pedido(planes) -> None:
                        "dia, y los feriados o congelamientos ya no la mueven. Para "
                        "volver al calculo automatico, desmarca la casilla.")
 
+        # --- Fechas a medida: casos excepcionales con fechas acordadas
+        st.markdown("**Fechas a medida**")
+        fechas_guardadas = db.fechas_de(pq["id"])
+        a_medida = st.checkbox(
+            "Este plan tiene fechas a medida", value=bool(fechas_guardadas),
+            key=k("medida"),
+            help="Para casos excepcionales: el alumno viene en fechas acordadas, "
+                 "en cualquier sede. Sus clases cuentan solo en esas fechas.")
+        fechas_medida, fechas_malas = [], []
+        if a_medida:
+            texto_fechas = st.text_area(
+                "Fechas de sus clases",
+                value=", ".join(f.strftime("%d/%m") for f in fechas_guardadas),
+                placeholder="Ej. 30/09, 02/10, 05/10, 09/10  o  30 setiembre, 2, 5, 9",
+                key=k("fechas_txt"))
+            fechas_medida, fechas_malas = logic.leer_fechas(texto_fechas, inicio)
+            if fechas_malas:
+                st.error("No entendi estas fechas: " + ", ".join(fechas_malas))
+            if fechas_medida:
+                st.caption(f"{len(fechas_medida)} fechas para {logic.sesiones_txt(sesiones)}: "
+                           + " · ".join(f.strftime("%d/%m") for f in fechas_medida))
+                if len(fechas_medida) < int(sesiones):
+                    st.warning(f"Faltan {int(sesiones) - len(fechas_medida)} fechas para "
+                               "completar sus clases.")
+                if fechas_medida[0] < inicio:
+                    st.warning("La primera fecha es anterior al inicio del plan: mueve el "
+                               "inicio a esa fecha.")
+
         cambio_calendario = (
             inicio != logic.a_fecha(pq["fecha_inicio"])
             or int(sesiones) != int(pq["sesiones_totales"])
             or dias_grupo != str(pq.get("dias_asiste") or "")
             or grupo_id != pq.get("grupo_id")
-            or any(hist_guardado.get(h) != d for h, d in historial_ep))
+            or any(hist_guardado.get(h) != d for h, d in historial_ep)
+            or (fechas_medida if a_medida else []) != fechas_guardadas)
         sin_entrenar = db.fechas_sin_entrenar(grupo_id)
         # Si el grupo cambio de horario a mitad del plan, lo anterior al
         # cambio se cuenta con los dias de antes
@@ -1515,6 +1651,10 @@ def editar_pedido(planes) -> None:
         cronograma = logic.proximas_sesiones(inicio, int(sesiones), dias_grupo,
                                              excluir=sin_entrenar,
                                              historial=historial)
+        if a_medida and fechas_medida:
+            cronograma = [f for f in fechas_medida if f not in sin_entrenar][:int(sesiones)]
+            if not fijar and len(cronograma) >= int(sesiones):
+                fin = cronograma[-1]
         if cronograma and fin:
             st.info(
                 f"**{logic.sesiones_txt(sesiones)}** entrenando "
@@ -1541,6 +1681,11 @@ def editar_pedido(planes) -> None:
                 st.error("Marca la casilla de confirmacion.")
             elif entregado > precio:
                 st.error("El monto entregado no puede ser mayor al cobrado.")
+            elif a_medida and (fechas_malas or len(fechas_medida) < int(sesiones)):
+                st.error("Revisa las fechas a medida: tiene que haber una por cada "
+                         "clase y todas legibles.")
+            elif a_medida and fechas_medida and fechas_medida[0] < inicio:
+                st.error("La primera fecha a medida es anterior al inicio del plan.")
             elif fijar and not (motivo_fin or "").strip():
                 st.error("Escribe el motivo de la fecha puesta a mano: queda "
                          "registrado.")
@@ -1556,6 +1701,10 @@ def editar_pedido(planes) -> None:
                         motivo_fin=(motivo_fin or "").strip() or None)
                     for hasta, dias_prev in historial_ep:
                         db.fijar_historial(pq["id"], hasta, dias_prev, dias_grupo)
+                    if a_medida:
+                        db.fijar_fechas(pq["id"], fechas_medida)
+                    elif fechas_guardadas:
+                        db.fijar_fechas(pq["id"], [])
                     nuevo = db.paquete(pq["id"]) or {}
                     fin_real = logic.a_fecha(nuevo.get("fecha_fin")) or fin
                     st.toast("Pedido corregido", icon="\u2705")
