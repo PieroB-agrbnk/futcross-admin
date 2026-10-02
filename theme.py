@@ -389,6 +389,17 @@ section[data-testid="stSidebar"] .stButton > button[kind="primary"] p {{ color: 
     .st-key-checkin [data-testid="stHorizontalBlock"] {{ flex-direction: column-reverse; }}
     .resultado.espera {{ display: none; }}
 }}
+
+/* Nombres de "Entrenaron hoy" en el Panel: pastillas que abren la ficha */
+.st-key-hoy_chips {{ flex-wrap: wrap; gap: .4rem; }}
+.st-key-hoy_chips [data-testid="stElementContainer"] {{ width: auto !important; }}
+.st-key-hoy_chips button {{
+    border: 1px solid {BORDE} !important; border-radius: 999px !important;
+    background: #fff !important; color: {TINTA} !important;
+    padding: .2rem .85rem !important; min-height: 0 !important;
+}}
+.st-key-hoy_chips button p {{ font-size: .82rem !important; }}
+.st-key-hoy_chips button:hover {{ border-color: {BRASA} !important; color: {BRASA} !important; }}
 </style>
 """
 

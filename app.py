@@ -52,7 +52,7 @@ theme.aplicar_estilos()
 
 # Se muestra en la barra lateral. Sirve para saber de un vistazo si la version
 # que estas viendo en la nube es la misma que tienes en tu computadora.
-VERSION = "4.1"
+VERSION = "4.2"
 
 DIAS_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
 TURNOS = ["MANANA", "TARDE", "NOCHE"]
@@ -764,10 +764,14 @@ def pagina_panel() -> None:
     if not asist_hoy.empty:
         theme.seccion("Entrenaron hoy",
                       f"{len(asist_hoy)} de {vigentes} alumnos con paquete vigente")
-        st.markdown(
-            "".join(theme.pastilla(r["alumno"], str(r["hora"])[:5])
-                    for _, r in asist_hoy.iterrows()),
-            unsafe_allow_html=True)
+        # Cada nombre es un boton que abre la ficha del alumno. Antes eran
+        # pastillas de HTML, y la primera se rompia en pantalla.
+        with st.container(horizontal=True, key="hoy_chips"):
+            for _, r in asist_hoy.iterrows():
+                st.button(f"{r['alumno']} · {str(r['hora'])[:5]}",
+                          key=f"hoy_{r['id']}", on_click=ir_a_ficha,
+                          args=(r["alumno_id"],),
+                          help="Ver su ficha y su reporte de asistencia")
 
     izq, der = st.columns([1.2, 1], gap="large")
 
@@ -913,8 +917,23 @@ def pagina_panel() -> None:
 # =====================================================================
 # 3. ALUMNOS
 # =====================================================================
+def ir_a_ficha(alumno_id: str) -> None:
+    """Desde el Panel, abre la ficha de ese alumno en la pantalla Alumnos."""
+    st.session_state["pagina"] = "Alumnos"
+    st.session_state["ficha_directa"] = alumno_id
+
+
 def pagina_alumnos() -> None:
     theme.cabecera("Alumnos", fecha_larga(logic.hoy()).upper(), "Padron")
+
+    # Si se llego tocando un nombre en el Panel, se abre su ficha directo
+    directa = st.session_state.get("ficha_directa")
+    if directa:
+        if st.button("Volver a la lista de alumnos", key="volver_lista"):
+            st.session_state.pop("ficha_directa", None)
+            st.rerun()
+        ficha_alumno(directa)
+        return
 
     if es_admin():
         tab_lista, tab_nuevo, tab_editar = st.tabs(
@@ -3197,6 +3216,7 @@ def menu_lateral() -> str:
                 if st.button(nombre, key=f"nav_{nombre}", width="stretch",
                              type="primary" if activa else "secondary"):
                     st.session_state["pagina"] = nombre
+                    st.session_state.pop("ficha_directa", None)
                     st.rerun()
 
         st.markdown('<div class="menu-grupo">Hoy</div>', unsafe_allow_html=True)
