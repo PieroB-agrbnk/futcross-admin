@@ -17,17 +17,42 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+import importlib   # noqa: E402
+import os          # noqa: E402
+
 import acceso      # noqa: E402
 import db          # noqa: E402
 import importar    # noqa: E402
 import logic       # noqa: E402
 import theme       # noqa: E402
 
+
+def _al_dia(modulo):
+    """Recarga un modulo si su archivo cambio desde que se cargo.
+
+    Streamlit Cloud, despues de un push, vuelve a correr app.py pero a
+    veces deja en memoria la version vieja de db.py o logic.py. La app
+    terminaba llamando funciones que todavia no existian (AttributeError)
+    hasta que alguien reiniciaba a mano. Asi se pone al dia sola.
+    """
+    ruta = getattr(modulo, "__file__", None)
+    if not ruta or not os.path.exists(ruta):
+        return
+    actual = os.path.getmtime(ruta)
+    if getattr(modulo, "_cargado_mtime", None) != actual:
+        importlib.reload(modulo)
+        modulo._cargado_mtime = actual
+
+
+# El orden importa: logic primero, porque db e importar la usan
+for _modulo in (logic, theme, acceso, db, importar):
+    _al_dia(_modulo)
+
 theme.aplicar_estilos()
 
 # Se muestra en la barra lateral. Sirve para saber de un vistazo si la version
 # que estas viendo en la nube es la misma que tienes en tu computadora.
-VERSION = "4.0"
+VERSION = "4.1"
 
 DIAS_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
 TURNOS = ["MANANA", "TARDE", "NOCHE"]
