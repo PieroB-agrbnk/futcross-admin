@@ -27,7 +27,7 @@ theme.aplicar_estilos()
 
 # Se muestra en la barra lateral. Sirve para saber de un vistazo si la version
 # que estas viendo en la nube es la misma que tienes en tu computadora.
-VERSION = "3.8"
+VERSION = "3.9"
 
 DIAS_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
 TURNOS = ["MANANA", "TARDE", "NOCHE"]
@@ -536,7 +536,7 @@ def pasar_lista() -> None:
             "Quedan": None if pd.isna(restantes) else int(restantes),
             "Estado": ("Ya marcado" if a["alumno_id"] in ya
                        else "Le toca hoy" if toca and activo
-                       else "Otro dia" if activo
+                       else "Otro dia: clase extra" if activo
                        else str(a.get("estado_real") or "").title()),
         })
     tabla = pd.DataFrame(filas)
@@ -570,7 +570,7 @@ def pasar_lista() -> None:
     nuevos = editado[editado["Vino"] & ~editado["ya"]]
     if st.button(f"Guardar lista ({len(nuevos)} por registrar)", type="primary",
                  disabled=nuevos.empty, key="lista_guardar", width="stretch"):
-        hechos, sin_plan = 0, []
+        hechos, sin_plan, extras = 0, [], []
         for _, f in nuevos.iterrows():
             if not f["activo"] or pd.isna(f["paquete_id"]) or not f["paquete_id"]:
                 sin_plan.append(f["Alumno"])
@@ -580,10 +580,15 @@ def pasar_lista() -> None:
                                      origen="LISTA",
                                      fecha=None if fecha == hoy else fecha)
                 hechos += 1
+                if str(f["Estado"]).startswith("Otro dia"):
+                    extras.append(f["Alumno"])
             except Exception as e:
                 if "uq_asistencia_dia" not in str(e) and "duplicate" not in str(e).lower():
                     st.error(f"No se pudo marcar a {f['Alumno']}: {e}")
         aviso = f"Lista guardada: {hechos} asistencias registradas."
+        if extras:
+            aviso += (f" A {', '.join(extras)} se les desconto una clase extra "
+                      "porque hoy no es su dia.")
         if sin_plan:
             aviso += (" No se marco a " + ", ".join(sin_plan) +
                       " porque su plan no esta vigente: que pase por recepcion.")
@@ -636,9 +641,9 @@ def marcar_uno_por_uno(hoy) -> None:
                     st.rerun()
 
             st.caption(
-                "El plan corre por calendario: las sesiones se cuentan desde el dia "
-                "que arranca, vaya o no vaya el alumno. Marcar aca no descuenta "
-                "nada, solo deja registro de quien vino."
+                "El plan corre por calendario: en sus dias, las clases se cuentan "
+                "vaya o no vaya el alumno. Si viene un dia que no es suyo, esa "
+                "clase se le descuenta como extra y su plan termina una clase antes."
             )
 
         with der:

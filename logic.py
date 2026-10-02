@@ -137,13 +137,13 @@ def puede_entrenar(paquete: dict | None, ya_marco_hoy: bool = False,
         fin = a_fecha(paquete.get("fecha_fin"))
         return False, "VENCIDO", f"Tu plan termino el {fin.strftime('%d/%m/%Y')}. Toca renovar."
 
-    # Hoy no toca entrenar a su grupo: no se le impide pasar, pero se le
-    # avisa, porque su plan corre por los dias que eligio.
+    # Hoy no es su dia: puede pasar, pero esa clase se le descuenta como
+    # extra (migracion 029) y su plan termina una clase antes.
     dias = paquete.get("dias_asiste")
     if dias and not es_dia_de_entrenamiento(ref, dias):
         return True, "OTRO_DIA", (
-            "Hoy no es uno de tus dias. Igual quedas registrado, pero tu plan "
-            "corre por los dias que elegiste.")
+            "Hoy no es uno de tus dias. Puedes entrenar, y esta clase se te "
+            "descuenta como una clase extra.")
     if ya_marco_hoy:
         return False, "YA_MARCO", "Ya registraste tu asistencia de hoy."
 
