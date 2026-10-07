@@ -52,7 +52,7 @@ theme.aplicar_estilos()
 
 # Se muestra en la barra lateral. Sirve para saber de un vistazo si la version
 # que estas viendo en la nube es la misma que tienes en tu computadora.
-VERSION = "4.2"
+VERSION = "4.3"
 
 DIAS_SEMANA = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
 TURNOS = ["MANANA", "TARDE", "NOCHE"]
@@ -439,7 +439,7 @@ def procesar_marca(fila: dict) -> None:
     if autorizado:
         try:
             db.marcar_asistencia(alumno_id, pq["id"], sede=fila.get("sede"), origen="KIOSCO",
-                                 marcado_por=st.session_state.get("lista_profe")
+                                 marcado_por=st.session_state.get("ultimo_profe")
                                  or ETIQUETA_ROL.get(rol(), ""))
         except Exception as e:
             if "uq_asistencia_dia" in str(e) or "duplicate" in str(e).lower():
@@ -540,10 +540,6 @@ def pasar_lista() -> None:
                           key="lista_fecha",
                           help="Hasta una semana atras, por si se paso la lista tarde")
 
-    profe = st.text_input(
-        "Profe que pasa lista", key="lista_profe", placeholder="Ej. Marco",
-        help="Queda guardado en cada asistencia, para el reporte del alumno")
-
     alumnos = db.panel_alumnos()
     a_medida = db.fechas_todas()
     # Los de este grupo, y los que tienen fechas a medida para ese dia aunque
@@ -602,24 +598,53 @@ def pasar_lista() -> None:
                       key="lista_todos",
                       help="Marca a todos y desmarca a los que faltaron")
     tabla["Vino"] = tabla["ya"] | (tabla["toca"] & todos)
-    editado = st.data_editor(
-        tabla[["Vino", "Alumno", "Dias", "Quedan", "Estado",
-               "alumno_id", "paquete_id", "activo", "ya"]],
-        hide_index=True, width="stretch",
-        key=f"lista_{g['id']}_{fecha}_{todos}_{st.session_state.get('lista_v', 0)}",
-        disabled=["Alumno", "Dias", "Quedan", "Estado"],
-        column_config={
-            "Vino": st.column_config.CheckboxColumn("Vino"),
-            "Quedan": st.column_config.NumberColumn("Quedan", help="Clases que le quedan"),
-            "alumno_id": None, "paquete_id": None, "activo": None, "ya": None,
-        })
 
-    nuevos = editado[editado["Vino"] & ~editado["ya"]]
-    if not (profe or "").strip() and not nuevos.empty:
-        st.caption("Escribe arriba el nombre del profe para poder guardar la lista.")
-    if st.button(f"Guardar lista ({len(nuevos)} por registrar)", type="primary",
-                 disabled=nuevos.empty or not (profe or "").strip(),
-                 key="lista_guardar", width="stretch"):
+    # Los profes que ya pasaron lista, para elegir sin escribir
+    try:
+        recientes = db.asistencias(hoy - timedelta(days=45), hoy)
+        profes = sorted({str(x).strip() for x in recientes.get("marcado_por", pd.Series(dtype=str))
+                         if isinstance(x, str) and x.strip()}) if not recientes.empty else []
+    except Exception:
+        profes = []
+    ultimo = st.session_state.get("ultimo_profe")
+    if ultimo and ultimo not in profes:
+        profes.append(ultimo)
+
+    # Todo dentro de un formulario: tocar las casillas ya no recarga la
+    # pantalla (en el celular cada toque demoraba y parecia colgada), y el
+    # nombre del profe queda justo encima del boton, donde se ve.
+    with st.form(f"form_lista_{g['id']}_{fecha}", border=False):
+        editado = st.data_editor(
+            tabla[["Vino", "Alumno", "Dias", "Quedan", "Estado",
+                   "alumno_id", "paquete_id", "activo", "ya"]],
+            hide_index=True, width="stretch",
+            key=f"lista_{g['id']}_{fecha}_{todos}_{st.session_state.get('lista_v', 0)}",
+            disabled=["Alumno", "Dias", "Quedan", "Estado"],
+            column_config={
+                "Vino": st.column_config.CheckboxColumn("Vino"),
+                "Quedan": st.column_config.NumberColumn("Quedan", help="Clases que le quedan"),
+                "alumno_id": None, "paquete_id": None, "activo": None, "ya": None,
+            })
+        # Se propone el ultimo profe que guardo en este celular
+        if ultimo and not st.session_state.get("lista_profe_sel"):
+            st.session_state["lista_profe_sel"] = ultimo
+        profe = st.selectbox(
+            "Profe que pasa lista", profes, key="lista_profe_sel", index=None,
+            accept_new_options=True, placeholder="Elige tu nombre o escribelo",
+            help="Queda guardado en cada asistencia, para el reporte del alumno")
+        guardar = st.form_submit_button("Guardar lista", type="primary", width="stretch")
+
+    if guardar:
+        profe = (profe or "").strip()
+        nuevos = editado[editado["Vino"] & ~editado["ya"]]
+        if not profe:
+            st.error("Falta el nombre del profe: eligelo o escribelo justo encima del "
+                     "boton y vuelve a guardar. Tus marcas no se pierden.")
+            return
+        if nuevos.empty:
+            st.info("No marcaste a nadie nuevo.")
+            return
+        st.session_state["ultimo_profe"] = profe
         hechos, sin_plan, extras = 0, [], []
         for _, f in nuevos.iterrows():
             if not f["activo"] or pd.isna(f["paquete_id"]) or not f["paquete_id"]:
@@ -636,7 +661,7 @@ def pasar_lista() -> None:
             except Exception as e:
                 if "uq_asistencia_dia" not in str(e) and "duplicate" not in str(e).lower():
                     st.error(f"No se pudo marcar a {f['Alumno']}: {e}")
-        aviso = f"Lista guardada: {hechos} asistencias registradas."
+        aviso = f"Lista guardada: {hechos} asistencias registradas por {profe}."
         if extras:
             aviso += (f" A {', '.join(extras)} se les desconto una clase extra "
                       "porque hoy no es su dia.")
